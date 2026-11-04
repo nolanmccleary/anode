@@ -3,7 +3,7 @@
 
 fn main() {
 
-    use anode::*;
+    use anode::tensor_lib::*;
     
 
     let mut tensor1: Tensor<f32> = Tensor::from_vec(vec![0.0, 1.4, 3.5, 6.2], vec![2, 2]).unwrap();
@@ -19,5 +19,5 @@ fn main() {
 
 
     
-    println!("{}", request_tequila());
+    println!("{}", anode::request_tequila());
 }
