@@ -88,7 +88,6 @@ impl <'a, T> TensorInterface <T> for TensorView<'a, T> {
 
 impl <T: Default> Tensor<T> {
 
-
     pub fn from_vec(data: Vec<T>, shape: Vec<usize>) -> Result<Self, TensorError> {
 
         if data.len() != shape.iter().product() {return Err(TensorError::InvalidShape)}
@@ -126,40 +125,42 @@ impl <T: Default> Tensor<T> {
             strides: self.strides.clone()
         }
     }
-
-
-    pub fn transpose(&self) -> TensorView<'_, T> {
-        let mut shape = self.shape.clone();
-        shape.reverse();
-
-        let mut strides = self.strides.clone();
-        strides.reverse();
-
-        TensorView {
-            data: self.data.as_deref().unwrap(),
-            shape,
-            strides
-        }
-    }
-
-
-    pub fn reshape(&self, shape: Vec<usize>) -> Result<TensorView<'_, T>, TensorError> {
-        
-        if shape.iter().product::<usize>() != self.shape.iter().product() {return Err(TensorError::InvalidShape)}
-
-        let strides = get_strides(&shape);
-
-        Ok(TensorView {
-            data: self.data.as_deref().unwrap(),
-            shape,
-            strides
-        })
-    }
-
-
-
 }
 
+
+pub fn transpose<'a, S, T>(source: &'a S) -> TensorView<'a, T> 
+where
+    S: TensorInterface<T>,
+{
+    let mut shape = source.shape().to_vec();
+    shape.reverse();
+
+    let mut strides = source.strides().to_vec();
+    strides.reverse();
+
+    TensorView {
+        data: source.data(), 
+        shape,
+        strides
+    }
+}
+
+
+pub fn reshape<'a, S, T>(source: &'a S, shape: Vec<usize>) -> Result<TensorView<'a, T>, TensorError>
+where 
+    S: TensorInterface<T>
+{
+    
+    if shape.iter().product::<usize>() != source.shape().to_vec().iter().product() {return Err(TensorError::InvalidShape)}
+
+    let strides = get_strides(&shape);
+
+    Ok(TensorView {
+        data: source.data(), 
+        shape,
+        strides
+    })
+}
 
 
 
