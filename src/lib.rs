@@ -118,6 +118,7 @@ impl <T: Default + for<'a>AddAssign<&'a T>> Tensor<T> {
 
 
     //Sum over an axis into another tensor
+    //TODO: Accomodate permutations
     pub fn sum<'a>(&self, targ: &'a mut Tensor<T>, axis: usize) -> Result<TensorView<'a, T>, TensorError> {
         if axis >= self.shape.len() {return Err(TensorError::InvalidAxis)}
 
@@ -139,10 +140,11 @@ impl <T: Default + for<'a>AddAssign<&'a T>> Tensor<T> {
             }
         };
 
+        let data = self.data.as_deref().unwrap();
 
-        for i in 0..self.shape.len() {
+        for i in 0..data.len() {
             let j = (i / pa) * pb + i % pb;
-            targ.data.as_mut().unwrap()[j] += &self.data.as_deref().unwrap()[i];
+            targ.data.as_mut().unwrap()[j] += &data[i];
         }
         
 
