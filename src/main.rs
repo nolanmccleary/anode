@@ -3,15 +3,13 @@
 
 fn main() {
 
-
-
-
+    use anode::*;
     
 
-    let tensor1: anode::Tensor<f32> = anode::Tensor::from_vec(vec![0.0, 1.4, 3.5, 6.2], vec![2, 2]).unwrap();
-    let mut tensor2: anode::Tensor<f32> = anode::Tensor::init(vec![2, 2]).unwrap();
+    let mut tensor1: Tensor<f32> = Tensor::from_vec(vec![0.0, 1.4, 3.5, 6.2], vec![2, 2]).unwrap();
+    let mut tensor2: Tensor<f32> = Tensor::init(vec![2, 2]).unwrap();
     
-    let tv1 = tensor1.sum(&mut tensor2, 1);
+    let tv1 = sum(&mut tensor1, &mut tensor2, 1);
 
     // println!("{}", tv1);
     // println!("{}", tensor2);
@@ -21,5 +19,5 @@ fn main() {
 
 
     
-    println!("{}", anode::request_tequila());
+    println!("{}", request_tequila());
 }

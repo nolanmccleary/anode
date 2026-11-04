@@ -31,29 +31,69 @@ pub enum TensorError
 }
 
 
+fn get_strides(shape: &[usize]) -> Vec<usize> {
+    let mut strides = vec![0; shape.len()];
+    let mut stride = 1;
 
-
-
-impl <T: Default + for<'a>AddAssign<&'a T>> Tensor<T> {
-
-    fn get_strides(shape: &[usize]) -> Vec<usize> {
-        let mut strides = vec![0; shape.len()];
-        let mut stride = 1;
-
-        for i in (0..shape.len()).rev() {
-            strides[i] = stride;
-            stride = stride * shape[i];
-        }
-
-        strides
+    for i in (0..shape.len()).rev() {
+        strides[i] = stride;
+        stride = stride * shape[i];
     }
+
+    strides
+}
+
+
+
+pub trait TensorInterface <T> {
+    fn data(&self) -> &[T];
+    fn shape(&self) -> &[usize];
+    fn strides(&self) -> &[usize];
+}
+
+
+
+impl <T> TensorInterface <T> for Tensor<T> {
+   fn data(&self) -> &[T] {
+       self.data.as_deref().unwrap()
+   } 
+
+   fn shape(&self) -> &[usize] {
+       self.shape.as_ref()
+   }
+
+   fn strides(&self) -> &[usize] {
+       self.strides.as_ref()
+   }
+}
+
+
+
+impl <'a, T> TensorInterface <T> for TensorView<'a, T> {
+   fn data(&self) -> &'a [T] {
+       self.data
+   } 
+
+   fn shape(&self) -> &[usize] {
+       self.shape.as_ref()
+   }
+
+   fn strides(&self) -> &[usize] {
+       self.strides.as_ref()
+   }
+}
+
+
+
+
+impl <T: Default> Tensor<T> {
 
 
     pub fn from_vec(data: Vec<T>, shape: Vec<usize>) -> Result<Self, TensorError> {
 
         if data.len() != shape.iter().product() {return Err(TensorError::InvalidShape)}
         
-        let strides: Vec<usize> = Self::get_strides(&shape);
+        let strides: Vec<usize> = get_strides(&shape);
 
         Ok(Self{
             data: Some(data),
@@ -69,7 +109,7 @@ impl <T: Default + for<'a>AddAssign<&'a T>> Tensor<T> {
     {
         let data = std::iter::repeat_with(T::default).take(shape.iter().product()).collect::<Vec<T>>();
 
-        let strides: Vec<usize> = Self::get_strides(&shape);
+        let strides: Vec<usize> = get_strides(&shape);
 
         Ok(Self{
             data: Some(data),
@@ -107,7 +147,7 @@ impl <T: Default + for<'a>AddAssign<&'a T>> Tensor<T> {
         
         if shape.iter().product::<usize>() != self.shape.iter().product() {return Err(TensorError::InvalidShape)}
 
-        let strides = Self::get_strides(&shape);
+        let strides = get_strides(&shape);
 
         Ok(TensorView {
             data: self.data.as_deref().unwrap(),
@@ -117,47 +157,53 @@ impl <T: Default + for<'a>AddAssign<&'a T>> Tensor<T> {
     }
 
 
-    //Sum over an axis into another tensor
-    //TODO: Accomodate permutations
-    pub fn sum<'a>(&self, targ: &'a mut Tensor<T>, axis: usize) -> Result<TensorView<'a, T>, TensorError> {
-        if axis >= self.shape.len() {return Err(TensorError::InvalidAxis)}
 
-        let mut new_shape: Vec<usize> = self.shape.clone();
-
-        let pb: usize = new_shape[axis + 1..].iter().product();
-        let pa = pb * new_shape[axis];
-
-        new_shape.remove(axis);
-        let new_size = new_shape.iter().product();
-
-        match targ.data.as_deref() {
-            None => {
-                targ.data = Some(std::iter::repeat_with(T::default).take(new_size).collect()); 
-            },
-
-            Some(vect) => {
-                if vect.len() != new_size {return Err(TensorError::InvalidShape)}
-            }
-        };
-
-        let data = self.data.as_deref().unwrap();
-
-        for i in 0..data.len() {
-            let j = (i / pa) * pb + i % pb;
-            targ.data.as_mut().unwrap()[j] += &data[i];
-        }
-        
-
-        let new_strides = Self::get_strides(&new_shape);
-
-
-        Ok(TensorView{
-            data: targ.data.as_deref().unwrap(),
-            shape: new_shape,
-            strides: new_strides
-        })
-    }
 }
 
 
 
+
+//Sum over an axis into another tensor
+//TODO: Accomodate permutations
+pub fn sum<'a, 'b, T, S>(source: &'a S, targ: &'b mut Tensor<T>, axis: usize) -> Result<TensorView<'b, T>, TensorError> 
+where 
+    S: TensorInterface<T>,
+    T: Default + for<'c>AddAssign<&'c T>
+{
+    if axis >= source.shape().len() {return Err(TensorError::InvalidAxis)}
+
+    let mut new_shape = source.shape().to_vec();
+
+    let pb: usize = new_shape[axis + 1..].iter().product();
+    let pa = pb * new_shape[axis];
+
+    new_shape.remove(axis);
+    let new_size = new_shape.iter().product();
+
+    match targ.data.as_deref() {
+        None => {
+            targ.data = Some(std::iter::repeat_with(T::default).take(new_size).collect()); 
+        },
+
+        Some(vect) => {
+            if vect.len() != new_size {return Err(TensorError::InvalidShape)}
+        }
+    };
+
+    let data = source.data();
+
+    for i in 0..data.len() {
+        let j = (i / pa) * pb + i % pb;
+        targ.data.as_mut().unwrap()[j] += &data[i];
+    }
+    
+
+    let new_strides = get_strides(&new_shape);
+
+
+    Ok(TensorView{
+        data: targ.data.as_deref().unwrap(),
+        shape: new_shape,
+        strides: new_strides
+    })
+}
