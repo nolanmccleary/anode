@@ -32,43 +32,22 @@ fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     out
 }
 
-fn scores_via_cute(q: &[f32], k: &[f32], s: usize, d: usize) -> Vec<f32> {
-    let kt = Modes::row_major(&[s as i64, d as i64])
-        .apply(&Op::Permute(vec![1, 0]))
-        .coalesce();
-    let mut out = vec![0f32; s * s];
-    for i in 0..s {
-        for j in 0..s {
-            let mut acc = 0f32;
-            for dd in 0..d {
-                let addr = kt.crd2idx(&[dd as i64, j as i64]) as usize;
-                acc += q[i * d + dd] * k[addr];
-            }
-            out[i * s + j] = acc;
-        }
-    }
-    out
-}
-
-fn softmax_rows(scores: &[f32], s: usize) -> Vec<f32> {
-    let mut out = vec![0f32; s * s];
-    for i in 0..s {
-        let row = &scores[i * s..(i + 1) * s];
+fn softmax_last(x: &mut [f32], rows: usize, cols: usize) {
+    for i in 0..rows {
+        let row = &mut x[i * cols..(i + 1) * cols];
         let m = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0f32;
-        for j in 0..s {
-            let e = (row[j] - m).exp();
-            out[i * s + j] = e;
-            sum += e;
+        for v in row.iter_mut() {
+            *v = (*v - m).exp();
+            sum += *v;
         }
-        for j in 0..s {
-            out[i * s + j] /= sum;
+        for v in row.iter_mut() {
+            *v /= sum;
         }
     }
-    out
 }
 
-fn cute_attention(
+fn cute_mha(
     x: &[f32],
     wq: &[f32],
     wk: &[f32],
@@ -76,14 +55,56 @@ fn cute_attention(
     wo: &[f32],
     s: usize,
     d: usize,
+    h: usize,
 ) -> Vec<f32> {
+    let dh = d / h;
     let q = matmul(x, wq, s, d, d);
     let k = matmul(x, wk, s, d, d);
     let v = matmul(x, wv, s, d, d);
-    let scores = scores_via_cute(&q, &k, s, d);
-    let p = softmax_rows(&scores, s);
-    let attn = matmul(&p, &v, s, s, d);
-    matmul(&attn, wo, s, d, d)
+
+    let head = Modes::row_major(&[s as i64, d as i64])
+        .apply(&Op::Split(1, dh as i64))
+        .apply(&Op::Permute(vec![1, 0, 2]));
+    let addr = |hh: usize, ii: usize, dd: usize| head.crd2idx(&[hh as i64, ii as i64, dd as i64]) as usize;
+
+    let mut scores = vec![0f32; h * s * s];
+    for hh in 0..h {
+        for i in 0..s {
+            for j in 0..s {
+                let mut acc = 0f32;
+                for dd in 0..dh {
+                    acc += q[addr(hh, i, dd)] * k[addr(hh, j, dd)];
+                }
+                scores[(hh * s + i) * s + j] = acc;
+            }
+        }
+    }
+    softmax_last(&mut scores, h * s, s);
+
+    let mut attn = vec![0f32; h * s * dh];
+    for hh in 0..h {
+        for i in 0..s {
+            for dd in 0..dh {
+                let mut acc = 0f32;
+                for j in 0..s {
+                    acc += scores[(hh * s + i) * s + j] * v[addr(hh, j, dd)];
+                }
+                attn[(hh * s + i) * dh + dd] = acc;
+            }
+        }
+    }
+
+    let merge = Modes::row_major(&[h as i64, s as i64, dh as i64]).apply(&Op::Permute(vec![1, 0, 2]));
+    let mut merged = vec![0f32; s * d];
+    for i in 0..s {
+        for hh in 0..h {
+            for dd in 0..dh {
+                let src = merge.crd2idx(&[i as i64, hh as i64, dd as i64]) as usize;
+                merged[i * d + hh * dh + dd] = attn[src];
+            }
+        }
+    }
+    matmul(&merged, wo, s, d, d)
 }
 
 struct Built {
@@ -91,20 +112,26 @@ struct Built {
     inputs: Vec<(NodeIndex, Vec<f32>)>,
 }
 
-fn build_affine(g: &mut Graph, s: i64, d: i64) -> Built {
+fn build_mha(g: &mut Graph, s: i64, d: i64, h: i64) -> Built {
     let dim = IntExpr::from;
+    let dh = d / h;
     let x = g.tensor([dim(s), dim(d)], DType::F32);
     let wq = g.tensor([dim(d), dim(d)], DType::F32);
     let wk = g.tensor([dim(d), dim(d)], DType::F32);
     let wv = g.tensor([dim(d), dim(d)], DType::F32);
     let wo = g.tensor([dim(d), dim(d)], DType::F32);
-    let q = x.matmul(wq);
-    let k = x.matmul(wk);
-    let v = x.matmul(wv);
-    let scores = q.matmul(k.transpose(0, 1));
-    let p = scores.softmax(&[1]);
-    let attn = p.matmul(v);
-    let out: GraphTensor = attn.matmul(wo);
+
+    let heads = |t: GraphTensor| t.split_dims(1, dim(dh)).permute(&[1, 0, 2]);
+    let qh = heads(x.matmul(wq));
+    let kh = heads(x.matmul(wk));
+    let vh = heads(x.matmul(wv));
+
+    let scores = qh.matmul(kh.transpose(1, 2));
+    let p = scores.softmax(&[2]);
+    let attn = p.matmul(vh);
+    let merged = attn.permute(&[1, 0, 2]).merge_dims(1, 2);
+    let out = merged.matmul(wo);
+
     let inputs = vec![
         (x.id, fill((s * d) as usize, 1)),
         (wq.id, fill((d * d) as usize, 2)),
@@ -115,19 +142,12 @@ fn build_affine(g: &mut Graph, s: i64, d: i64) -> Built {
     Built { out: out.id, inputs }
 }
 
-fn main() {
-    let (s, d) = (32usize, 64usize);
-    println!("output-equality check: single-head attention  S={s}  D={d}\n");
-
+fn run_case(s: usize, d: usize, h: usize) -> (f32, f32, f32, f32) {
     let mut g = Graph::new();
-    let built = build_affine(&mut g, s as i64, d as i64);
-
+    let built = build_mha(&mut g, s as i64, d as i64, h as i64);
     let mut rt = MetalRuntime::load(&g).unwrap();
-    let search_inputs: FxHashMap<NodeIndex, HostBuffer> = built
-        .inputs
-        .iter()
-        .map(|(id, v)| (*id, v.clone().into()))
-        .collect();
+    let search_inputs: FxHashMap<NodeIndex, HostBuffer> =
+        built.inputs.iter().map(|(id, v)| (*id, v.clone().into())).collect();
     let opts = CompileOptions {
         generations: 4,
         generation_size: 6,
@@ -146,15 +166,11 @@ fn main() {
     rt.execute(arena.buffer()).unwrap();
     let affine = read_f32(&rt, &arena, built.out).unwrap();
 
-    let g2 = |i: usize| &built.inputs[i].1;
-    let cute = cute_attention(g2(0), g2(1), g2(2), g2(3), g2(4), s, d);
+    let gi = |i: usize| &built.inputs[i].1;
+    let cute = cute_mha(gi(0), gi(1), gi(2), gi(3), gi(4), s, d, h);
+    assert_eq!(affine.len(), cute.len());
 
-    assert_eq!(affine.len(), cute.len(), "output length mismatch");
-
-    let mut max_abs = 0f32;
-    let mut sum_abs = 0f64;
-    let mut max_rel = 0f32;
-    let mut peak = 0f32;
+    let (mut max_abs, mut sum_abs, mut max_rel, mut peak) = (0f32, 0f64, 0f32, 0f32);
     for (a, c) in affine.iter().zip(cute.iter()) {
         let diff = (a - c).abs();
         max_abs = max_abs.max(diff);
@@ -162,21 +178,47 @@ fn main() {
         max_rel = max_rel.max(diff / (a.abs() + 1e-6));
         peak = peak.max(a.abs());
     }
-    let mean_abs = sum_abs / affine.len() as f64;
+    (peak, max_abs, (sum_abs / affine.len() as f64) as f32, max_rel)
+}
 
-    println!("Luminal (affine, real Metal plan) executed; cute-addressed reference executed.");
-    println!("samples  affine[0..4] = {:?}", &affine[..4]);
-    println!("         cute  [0..4] = {:?}", &cute[..4]);
-    println!("\nelements        {}", affine.len());
-    println!("peak |affine|   {peak:.5}");
-    println!("max abs diff    {max_abs:.3e}");
-    println!("mean abs diff   {mean_abs:.3e}");
-    println!("max rel diff    {max_rel:.3e}");
-
-    let ok = max_abs < 1e-2 && max_rel < 1e-2;
+fn main() {
+    println!("multi-head attention — Luminal (Metal) vs cute-addressed reference");
+    println!("split(D->H,Dh) + permute + transpose + merge, all addressed through cute\n");
     println!(
-        "\nverdict: {}  (fp reduction-order tolerance; GPU-tiled vs CPU-sequential)",
-        if ok { "OUTPUTS MATCH" } else { "MISMATCH" }
+        "{:>5} {:>5} {:>4} {:>8} | {:>10} {:>11} {:>11} {:>11} | {:>7}",
+        "S", "D", "H", "elems", "peak|out|", "max abs", "mean abs", "max rel", "verdict"
     );
-    std::process::exit(if ok { 0 } else { 1 });
+    println!("{}", "-".repeat(86));
+
+    let cases = [
+        (32usize, 64usize, 4usize),
+        (64, 128, 8),
+        (128, 256, 8),
+        (256, 512, 8),
+        (512, 512, 16),
+        (512, 1024, 16),
+    ];
+    let mut all_ok = true;
+    for (s, d, h) in cases {
+        let (peak, max_abs, mean_abs, max_rel) = run_case(s, d, h);
+        let ok = max_rel < 5e-3 || max_abs < 1e-3;
+        all_ok &= ok;
+        println!(
+            "{:>5} {:>5} {:>4} {:>8} | {:>10.4} {:>11.3e} {:>11.3e} {:>11.3e} | {:>7}",
+            s,
+            d,
+            h,
+            s * d,
+            peak,
+            max_abs,
+            mean_abs,
+            max_rel,
+            if ok { "MATCH" } else { "MISMATCH" }
+        );
+    }
+    println!(
+        "\n{}",
+        if all_ok { "ALL CASES MATCH" } else { "SOME CASES MISMATCH" }
+    );
+    std::process::exit(if all_ok { 0 } else { 1 });
 }
