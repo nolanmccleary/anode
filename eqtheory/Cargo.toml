@@ -1,0 +1,37 @@
+[package]
+name = "eqtheory"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "compression"
+path = "src/compression.rs"
+
+[[bin]]
+name = "egraph"
+path = "src/egraph.rs"
+
+[[bin]]
+name = "compare"
+path = "src/compare.rs"
+
+[[bin]]
+name = "ab"
+path = "src/ab.rs"
+
+[[bin]]
+name = "sweep"
+path = "src/sweep.rs"
+
+[[bin]]
+name = "verify"
+path = "src/verify.rs"
+
+[dependencies]
+cute-layout = { path = "cute-layout" }
+egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
+luminal = { path = "../refs/luminal" }
+luminal_metal = { path = "../refs/luminal/crates/luminal_metal" }
+metal = { version = "0.31", features = ["mps"] }
+objc = "0.2"
+anyhow = "1"

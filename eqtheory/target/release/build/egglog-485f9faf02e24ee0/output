@@ -1,0 +1,2 @@
+cargo:rustc-env=FULL_VERSION=2.0.0_2026-11-16_3787810f
+
