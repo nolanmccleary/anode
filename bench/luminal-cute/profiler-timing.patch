@@ -1,0 +1,234 @@
+diff --git a/crates/luminal_metal/src/device.rs b/crates/luminal_metal/src/device.rs
+index f93da0a..52ec561 100644
+--- a/crates/luminal_metal/src/device.rs
++++ b/crates/luminal_metal/src/device.rs
+@@ -83,6 +83,31 @@ pub struct MetalExecutable {
+     installed: Option<Installed>,
+     cache: std::rc::Rc<std::cell::RefCell<FxHashMap<String, ComputePipelineState>>>,
+     stats: GraphStats,
++    /// GPU-side execution span (nanos) of the final command buffer of the most
++    /// recent `execute`, read from Metal's `GPUStartTime`/`GPUEndTime`. `None`
++    /// if the timestamps were unavailable. For single-command-buffer plans (all
++    /// GEMMs) this is the kernel's true on-GPU time, excluding CPU encode/submit
++    /// overhead — the precise cost the wall-clock profiler cannot isolate.
++    last_gpu_nanos: Option<u128>,
++}
++
++/// Read a command buffer's on-GPU execution span via `GPUStartTime`/`GPUEndTime`
++/// (metal-0.31 does not bind these, so message them directly). Returns `None` if
++/// the device did not report valid timestamps.
++fn command_buffer_gpu_nanos(command: &metal::CommandBufferRef) -> Option<u128> {
++    use metal::foreign_types::ForeignTypeRef;
++    use objc::{msg_send, runtime::Object, sel, sel_impl};
++    let obj = command.as_ptr() as *mut Object;
++    if obj.is_null() {
++        return None;
++    }
++    let start: f64 = unsafe { msg_send![obj, GPUStartTime] };
++    let end: f64 = unsafe { msg_send![obj, GPUEndTime] };
++    if end.is_finite() && start.is_finite() && end > start {
++        Some(((end - start) * 1e9) as u128)
++    } else {
++        None
++    }
+ }
+ impl MetalExecutable {
+     /// Native device used by this execution context.
+@@ -111,12 +136,20 @@ impl MetalExecutable {
+             installed: None,
+             cache: device.cache.clone(),
+             stats: GraphStats::default(),
++            last_gpu_nanos: None,
+         }
+     }
+ 
+     pub fn stats(&self) -> GraphStats {
+         self.stats
+     }
++
++    /// On-GPU execution span (nanos) of the most recent `execute`, from Metal's
++    /// GPU timestamps — `None` if unavailable. Excludes CPU encode/submit/sync
++    /// overhead, unlike wall-clock timing.
++    pub fn last_gpu_nanos(&self) -> Option<u128> {
++        self.last_gpu_nanos
++    }
+     pub fn slab_bytes(&self) -> usize {
+         self.stats.arena_bytes
+     }
+@@ -564,6 +597,7 @@ impl MetalExecutable {
+         if command.status() != MTLCommandBufferStatus::Completed {
+             bail!("Metal command failed with status {:?}", command.status());
+         }
++        self.last_gpu_nanos = command_buffer_gpu_nanos(command);
+         self.stats.launches += 1;
+         Ok(())
+     }
+diff --git a/crates/luminal_metal/src/profile.rs b/crates/luminal_metal/src/profile.rs
+index d48a8fc..7c01f3a 100644
+--- a/crates/luminal_metal/src/profile.rs
++++ b/crates/luminal_metal/src/profile.rs
+@@ -53,6 +53,8 @@ pub fn profile_candidate_at(
+     candidate_timeout: Option<Duration>,
+     shapes: &crate::symbolic::ShapeEnv,
+     arena_budget: Option<usize>,
++    steady_state: bool,
++    gpu_timestamp: bool,
+ ) -> Result<Measurement, ProfileFailure> {
+     luminal::collective::ensure_local_profile(plan).map_err(ProfileFailure::Prepare)?;
+     let staged = prepare_candidate(device, plan, staged, shapes, arena_budget)
+@@ -66,6 +68,30 @@ pub fn profile_candidate_at(
+         .map_err(ProfileFailure::Prepare)?;
+ 
+     let total = trials.max(1);
++    // GPU-timestamp mode needs the device to actually report timestamps; if the
++    // warmup execute above produced none, fall back to wall-clock steady-state.
++    if gpu_timestamp && device.last_gpu_nanos().is_some() {
++        return profile_steady_state(
++            device,
++            arena.buffer(),
++            &shapes.values,
++            total,
++            best_so_far,
++            candidate_timeout,
++            true,
++        );
++    }
++    if steady_state || gpu_timestamp {
++        return profile_steady_state(
++            device,
++            arena.buffer(),
++            &shapes.values,
++            total,
++            best_so_far,
++            candidate_timeout,
++            false,
++        );
++    }
+     let mut sum = 0u128;
+     for trial in 0..total {
+         // Mutable/donated inputs are restored by the profiling harness, not the executable.
+@@ -105,6 +131,70 @@ pub fn profile_candidate_at(
+     })
+ }
+ 
++/// Untimed back-to-back executes to ramp the GPU clocks before measuring.
++const STEADY_WARMUP: usize = 3;
++/// Minimum number of timed reps for a stable min (default path uses `trials`).
++const STEADY_MIN_REPS: usize = 30;
++/// Samples before the early-stop check may fire (give the min a chance to settle).
++const STEADY_EARLY_MIN: usize = 8;
++
++/// Steady-state cost = MIN over many back-to-back executes with the GPU warmed
++/// and pipelined. Unlike the default path (MEAN of single-shot wall-clock executes,
++/// re-initializing inputs each trial), this does not re-init between reps, so the
++/// kernels run back-to-back and sustained throughput — where tile-config variants
++/// actually differ — becomes visible. The returned `mean_nanos` field carries the
++/// min. Inputs are assumed data-independent in timing (true for GEMM and friends).
++fn profile_steady_state(
++    device: &mut MetalExecutable,
++    arena: &Buffer,
++    dims: &luminal::shape::DynMap,
++    trials: usize,
++    best_so_far: Option<u128>,
++    candidate_timeout: Option<Duration>,
++    use_gpu_timestamp: bool,
++) -> Result<Measurement, ProfileFailure> {
++    for _ in 0..STEADY_WARMUP {
++        device.execute(arena, dims).map_err(ProfileFailure::Execute)?;
++    }
++    let reps = trials.max(STEADY_MIN_REPS);
++    let mut best = u128::MAX;
++    let mut elapsed_total = 0u128;
++    for rep in 0..reps {
++        let start = Instant::now();
++        device.execute(arena, dims).map_err(ProfileFailure::Execute)?;
++        let wall = start.elapsed().as_nanos();
++        // GPU-timestamp mode costs the on-GPU span (no CPU encode/submit/sync);
++        // wall-clock drives the timeout/early-stop bookkeeping either way.
++        let dt = if use_gpu_timestamp {
++            device.last_gpu_nanos().unwrap_or(wall)
++        } else {
++            wall
++        };
++        best = best.min(dt);
++        elapsed_total += wall;
++        if candidate_timeout.is_some_and(|budget| elapsed_total > budget.as_nanos()) {
++            return Ok(Measurement::TimedOut {
++                elapsed_nanos: elapsed_total,
++                completed_trials: rep + 1,
++            });
++        }
++        // Once the min has had a chance to settle, abandon a candidate whose very
++        // best is already worse than the incumbent — it cannot win.
++        if rep + 1 >= STEADY_EARLY_MIN
++            && best_so_far.is_some_and(|incumbent| early_stop_exceeded(best, incumbent, 1.0))
++        {
++            return Ok(Measurement::Timed {
++                mean_nanos: best,
++                completed_trials: rep + 1,
++            });
++        }
++    }
++    Ok(Measurement::Timed {
++        mean_nanos: best,
++        completed_trials: reps,
++    })
++}
++
+ pub fn profile_candidate(
+     device: &mut MetalExecutable,
+     plan: &BufferIrGraph<DecodedLayout>,
+@@ -123,6 +213,8 @@ pub fn profile_candidate(
+         timeout,
+         &Default::default(),
+         None,
++        false,
++        false,
+     )
+ }
+ 
+diff --git a/crates/luminal_metal/src/search.rs b/crates/luminal_metal/src/search.rs
+index c09410c..4af3794 100644
+--- a/crates/luminal_metal/src/search.rs
++++ b/crates/luminal_metal/src/search.rs
+@@ -25,6 +25,22 @@ pub struct CompileOptions {
+     pub mutations: usize,
+     pub trials: usize,
+     pub seed: u64,
++    /// Steady-state profiling: measure the MIN of many back-to-back executes
++    /// (GPU clocks ramped, pipelined) instead of the default MEAN of single-shot
++    /// wall-clock executes. The default (mean/single-shot) metric cannot resolve
++    /// the throughput gap between near-equivalent kernels (e.g. tile-config
++    /// variants) because single executes never reach steady state; this mode can.
++    /// Opt-in — the default path is unchanged. (Timing only re-initializes inputs
++    /// once, so donated/in-place-mutated inputs may drift across reps; fine for
++    /// the data-independent kernels this is meant to separate.)
++    pub steady_state_profiling: bool,
++    /// GPU-timestamp profiling: cost = MIN over back-to-back executes of the
++    /// plan's on-GPU time (Metal `GPUStartTime`/`GPUEndTime`), excluding CPU
++    /// encode/submit/sync overhead entirely — the most faithful kernel timing,
++    /// and what distinguishes near-equivalent kernels the wall-clock paths cannot.
++    /// Implies steady-state back-to-back execution; falls back to wall-clock if
++    /// the device reports no timestamps. Opt-in; default path unchanged.
++    pub gpu_timestamp_profiling: bool,
+     pub search_log: bool,
+     pub candidate_timeout: Option<Duration>,
+     pub keep_finalists: usize,
+@@ -48,6 +64,8 @@ impl Default for CompileOptions {
+             mutations: 2,
+             trials: 3,
+             seed: 0,
++            steady_state_profiling: false,
++            gpu_timestamp_profiling: false,
+             search_log: true,
+             candidate_timeout: None,
+             keep_finalists: 4,
+@@ -132,6 +150,8 @@ impl Evaluator<'_> {
+                 options.candidate_timeout,
+                 shapes,
+                 options.device_budget_bytes,
++                options.steady_state_profiling,
++                options.gpu_timestamp_profiling,
+             );
+             device.uninstall();
+             match measured {

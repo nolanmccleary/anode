@@ -1,0 +1,3 @@
+; Fused matmul + bias-add (GEMM epilogue fusion). Inputs: A, B (broadcast matmul
+; operands), bias; plus the reduce axis and the output layout as metadata.
+(constructor LayoutTensorOpMatmulBiasGeneric (LayoutTensor LayoutTensor LayoutTensor i64 Layout) LayoutTensorOp)

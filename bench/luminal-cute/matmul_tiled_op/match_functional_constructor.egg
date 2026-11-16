@@ -1,0 +1,4 @@
+; Search-selectable tiled matmul. The last child is the tile-CONFIG index; the
+; match rule below mints one enode per config, so Luminal's genome search picks
+; the config by profiling (distinct enodes = distinct producers of the matmul).
+(constructor LayoutTensorOpMatmulTiledGeneric (LayoutTensor LayoutTensor Layout i64) LayoutTensorOp)
