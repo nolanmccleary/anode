@@ -74,6 +74,7 @@ pub const KERNELS: &[(&str, EqClass)] = &[
     ("rmsnorm_row", EqClass::MulEw),
     ("silu_mul", EqClass::MulEw),
     ("ew_chain", EqClass::MulEw),
+    ("attn_decode", EqClass::Softmax),
     ("xcopy_f", EqClass::Copy),
     ("xcopy_i", EqClass::Copy),
     ("xcopy_i2f", EqClass::CastI2F),
@@ -700,6 +701,54 @@ kernel void ew_chain(
         }
     }
     OUT[gid] = v;
+}
+
+kernel void attn_decode(
+    device const float* Q    [[buffer(0)]],
+    device const float* Kc   [[buffer(1)]],
+    device const float* Vc   [[buffer(2)]],
+    device const float* BIAS [[buffer(3)]],
+    device float*       OUT  [[buffer(4)]],
+    constant int*       p    [[buffer(5)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    int KV = p[0], G = p[1], CTX = p[2], HD = p[3];
+    int head = int(tgid) * int((256u) / 32u) + int(sgid);
+    if (head >= KV * G) return;
+    int kv = head / G;
+    int g = head % G;
+    int qoff = p[4] + kv * p[5] + g * p[6];
+    int koff = p[8] + kv * p[9];
+    int voff = p[12] + kv * p[13];
+    int boff = p[16] + kv * p[17] + g * p[18];
+    float scale = as_type<float>(p[20]);
+    float scores[8];
+    for (int c = 0; c < CTX; ++c) {
+        float acc = 0.0;
+        for (int e = int(lane); e < HD; e += 32) {
+            acc += Q[qoff + e * p[7]] * Kc[koff + c * p[10] + e * p[11]];
+        }
+        float dot = simd_sum(acc);
+        scores[c] = dot * scale + BIAS[boff + c * p[19]];
+    }
+    float m = -INFINITY;
+    for (int c = 0; c < CTX; ++c) m = max(m, scores[c]);
+    float ssum = 0.0;
+    for (int c = 0; c < CTX; ++c) {
+        scores[c] = exp(scores[c] - m);
+        ssum += scores[c];
+    }
+    float inv = 1.0f / ssum;
+    for (int e = int(lane); e < HD; e += 32) {
+        float o = 0.0;
+        for (int c = 0; c < CTX; ++c) {
+            o += scores[c] * inv * Vc[voff + c * p[14] + e * p[15]];
+        }
+        OUT[head * HD + e] = o;
+    }
 }
 
 kernel void rmsnorm_row(

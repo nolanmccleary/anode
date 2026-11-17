@@ -401,6 +401,7 @@ impl<'g> Exec<'g> {
             .filter(|(a, b)| !self.fuse_plan.contains_key(a) && !self.fuse_plan.contains_key(b))
             .collect();
         self.plan_chains(&free);
+        self.plan_attention();
         let generic = free
             .iter()
             .filter(|(a, b)| {
@@ -533,6 +534,230 @@ impl<'g> Exec<'g> {
             self.fuse_plan.insert(
                 tail,
                 Fused::Chain { primary: primary.unwrap(), exts, prog },
+            );
+        }
+    }
+
+    fn axis_stride(&mut self, id: NodeIndex, axis: usize) -> Option<i64> {
+        let (_, acc) = self.resolve_dry(id)?;
+        let rank = self.dims(id).len();
+        let ms = axis_modes(&acc, axis, rank);
+        match ms.len() {
+            0 => Some(0),
+            1 => Some(ms[0].1),
+            _ => None,
+        }
+    }
+
+    fn plan_attention(&mut self) {
+        let smaxes: Vec<(NodeIndex, NodeIndex)> = self
+            .fuse_plan
+            .iter()
+            .filter_map(|(fin, f)| match f {
+                Fused::Softmax { scores } => Some((*fin, *scores)),
+                _ => None,
+            })
+            .collect();
+        for (fin, scores) in smaxes {
+            let Some(Fused::Chain { primary: qk_rs, exts, prog }) =
+                self.fuse_plan.get(&scores).cloned()
+            else {
+                continue;
+            };
+            if prog[0] != 2 || prog[1] != 0 || prog[2] != 1 || prog[4] != 1 || prog[5] != 2 {
+                continue;
+            }
+            let scale_bits = prog[3];
+            let bias = exts[0];
+            let LogicalOp::ReduceSum { axis_from_end } = self.g[qk_rs].op else { continue };
+            let qk_mul = self.operands(qk_rs)[0];
+            if !matches!(self.g[qk_mul].op, LogicalOp::Mul) {
+                continue;
+            }
+            let qk_ops = self.operands(qk_mul);
+            let Some(vw) = self.sole_consumer(fin) else { continue };
+            if self.ctor(vw) != "LogicalIndexMapApply" {
+                continue;
+            }
+            let Some(pv_mul) = self.sole_consumer(vw) else { continue };
+            if self.ctor(pv_mul) != "LogicalMul" {
+                continue;
+            }
+            let Some(pv_rs) = self.sole_consumer(pv_mul) else { continue };
+            if !matches!(self.g[pv_rs].op, LogicalOp::ReduceSum { .. }) {
+                continue;
+            }
+            let v = *self
+                .operands(pv_mul)
+                .iter()
+                .find(|o| **o != vw)
+                .unwrap();
+            let dims = self.dims(qk_mul);
+            let rank = dims.len();
+            let hd_ax = rank - 1 - axis_from_end;
+            let varies = |me: &mut Self, id: NodeIndex, ax: usize| -> Option<bool> {
+                Some(me.axis_stride(id, ax)? != 0 && me.dims(id)[ax] != 1)
+            };
+            let (mut kv_ax, mut g_ax, mut ctx_ax) = (None, None, None);
+            let (mut a_is_q, mut ok) = (true, true);
+            for ax in 0..rank {
+                if ax == hd_ax || dims[ax] == 1 {
+                    continue;
+                }
+                let (Some(va), Some(vb)) = (
+                    varies(self, qk_ops[0], ax),
+                    varies(self, qk_ops[1], ax),
+                ) else {
+                    ok = false;
+                    break;
+                };
+                match (va, vb) {
+                    (true, true) => {
+                        if kv_ax.replace(ax).is_some() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    (true, false) => {
+                        if g_ax.is_none() {
+                            g_ax = Some(ax);
+                            a_is_q = true;
+                        } else if ctx_ax.is_none() {
+                            ctx_ax = Some(ax);
+                            a_is_q = false;
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    (false, true) => {
+                        if ctx_ax.is_none() && g_ax.is_none() {
+                            ctx_ax = Some(ax);
+                            a_is_q = true;
+                        } else if ctx_ax.is_none() {
+                            ctx_ax = Some(ax);
+                        } else if g_ax.is_none() {
+                            g_ax = Some(ax);
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    (false, false) => {}
+                }
+            }
+            let (Some(kv_ax), Some(g_ax), Some(ctx_ax)) = (kv_ax, g_ax, ctx_ax) else {
+                continue;
+            };
+            if !ok {
+                continue;
+            }
+            let (q_op, k_op) = if a_is_q {
+                (qk_ops[0], qk_ops[1])
+            } else {
+                (qk_ops[1], qk_ops[0])
+            };
+            let (kvn, gn, ctxn, hdn) = (dims[kv_ax], dims[g_ax], dims[ctx_ax], dims[hd_ax]);
+            if ctxn > 8 {
+                continue;
+            }
+            let pv_dims = self.dims(pv_rs);
+            if numel(&pv_dims) != kvn * gn * hdn {
+                continue;
+            }
+            let st = |me: &mut Self, id: NodeIndex, ax: usize| me.axis_stride(id, ax);
+            let (Some(qkv), Some(qg), Some(qhd)) = (
+                st(self, q_op, kv_ax),
+                st(self, q_op, g_ax),
+                st(self, q_op, hd_ax),
+            ) else {
+                continue;
+            };
+            let (Some(kkv), Some(kctx), Some(khd)) = (
+                st(self, k_op, kv_ax),
+                st(self, k_op, ctx_ax),
+                st(self, k_op, hd_ax),
+            ) else {
+                continue;
+            };
+            let pv_v_dims = self.dims(v);
+            let pvr = pv_v_dims.len();
+            let LogicalOp::ReduceSum { axis_from_end: pv_afe } = self.g[pv_rs].op else {
+                continue;
+            };
+            let pv_ctx_ax = pvr - 1 - pv_afe;
+            let mut pv_hd_ax = None;
+            let mut pv_kv_ax = None;
+            let pvm_dims = self.dims(pv_mul);
+            for ax in 0..pvr {
+                if ax == pv_ctx_ax || pvm_dims[ax] == 1 {
+                    continue;
+                }
+                if pvm_dims[ax] == hdn && pv_hd_ax.is_none() {
+                    let sv = varies(self, vw, ax);
+                    if sv == Some(false) {
+                        pv_hd_ax = Some(ax);
+                        continue;
+                    }
+                }
+                if pvm_dims[ax] == kvn && pv_kv_ax.is_none() {
+                    pv_kv_ax = Some(ax);
+                }
+            }
+            let (Some(pv_hd_ax), Some(pv_kv_ax)) = (pv_hd_ax, pv_kv_ax) else {
+                continue;
+            };
+            let (Some(vkv), Some(vctx), Some(vhd)) = (
+                st(self, v, pv_kv_ax),
+                st(self, v, pv_ctx_ax),
+                st(self, v, pv_hd_ax),
+            ) else {
+                continue;
+            };
+            let (Some(bkv), Some(bg), Some(bctx)) = (
+                st(self, bias, kv_ax),
+                st(self, bias, g_ax),
+                st(self, bias, ctx_ax),
+            ) else {
+                continue;
+            };
+            let fits = |v: i64| i32::try_from(v).is_ok();
+            if ![qkv, qg, qhd, kkv, kctx, khd, vkv, vctx, vhd, bkv, bg, bctx]
+                .iter()
+                .all(|x| fits(*x))
+            {
+                continue;
+            }
+            let mut params = [0i32; 25];
+            params[0] = kvn as i32;
+            params[1] = gn as i32;
+            params[2] = ctxn as i32;
+            params[3] = hdn as i32;
+            params[4] = 0;
+            params[5] = qkv as i32;
+            params[6] = qg as i32;
+            params[7] = qhd as i32;
+            params[8] = 0;
+            params[9] = kkv as i32;
+            params[10] = kctx as i32;
+            params[11] = khd as i32;
+            params[12] = 0;
+            params[13] = vkv as i32;
+            params[14] = vctx as i32;
+            params[15] = vhd as i32;
+            params[16] = 0;
+            params[17] = bkv as i32;
+            params[18] = bg as i32;
+            params[19] = bctx as i32;
+            params[20] = scale_bits;
+            for n in [qk_mul, qk_rs, scores, fin, vw, pv_mul] {
+                self.fuse_skip.insert(n);
+            }
+            self.fuse_plan.remove(&scores);
+            self.fuse_plan.remove(&fin);
+            self.fuse_plan.insert(
+                pv_rs,
+                Fused::Attn { q: q_op, k: k_op, v, bias, params },
             );
         }
     }
@@ -833,6 +1058,7 @@ impl<'g> Exec<'g> {
                         }
                         "silu_mul" => 3 * n * 4,
                         "ew_chain" => 3 * n * 4,
+                        "attn_decode" => 4 * n,
                         "softmax_rows" => 2 * n * 4,
                         other => panic!("traffic for {other}"),
                     }
@@ -945,6 +1171,26 @@ impl<'g> Exec<'g> {
                     &[gb, ub, &out],
                     &[(3, Scalar(n as u32)), (4, F32(k)), (5, F32(c3))],
                     n as u64,
+                );
+                self.vals.insert(id, Val { buf: out, dims, dtype: DType::F32 });
+            }
+            Fused::Attn { q, k, v, bias, params } => {
+                let (qb, _) = self.operand_meta(q);
+                let (kb, _) = self.operand_meta(k);
+                let (vb, _) = self.operand_meta(v);
+                let (bb, _) = self.operand_meta(bias);
+                let heads = (params[0] * params[1]) as u64;
+                let out = self.alloc(n as usize * 4);
+                let bufs: Vec<Buffer> = [&qb, &kb, &vb, &bb]
+                    .iter()
+                    .map(|x| self.vals[*x].buf.clone())
+                    .collect();
+                let threads = heads.div_ceil(8) * 256;
+                self.run1d(
+                    "attn_decode",
+                    &[&bufs[0], &bufs[1], &bufs[2], &bufs[3], &out],
+                    &[(5, Prog(params))],
+                    threads,
                 );
                 self.vals.insert(id, Val { buf: out, dims, dtype: DType::F32 });
             }
@@ -1365,6 +1611,7 @@ enum Fused {
     SiluMul { g: NodeIndex, u: NodeIndex, k: f32, c3: f32 },
     Softmax { scores: NodeIndex },
     Chain { primary: NodeIndex, exts: Vec<NodeIndex>, prog: [i32; 25] },
+    Attn { q: NodeIndex, k: NodeIndex, v: NodeIndex, bias: NodeIndex, params: [i32; 25] },
 }
 
 #[derive(Clone)]

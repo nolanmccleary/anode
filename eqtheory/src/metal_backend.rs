@@ -169,6 +169,9 @@ impl CuteMetal {
         if self.gemv_choice.borrow().contains_key(&key) {
             return;
         }
+        if std::env::var("GEMV_NOTUNE").is_ok() {
+            return;
+        }
         let bytes = k * n * 4;
         let copies = (96_000_000usize / bytes).clamp(1, 8);
         let wscratch = self.alloc_bytes(bytes * copies);
