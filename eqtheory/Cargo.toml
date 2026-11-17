@@ -104,3 +104,7 @@ path = "src/tmbench.rs"
 [[bin]]
 name = "export_model"
 path = "src/export_model.rs"
+
+[[bin]]
+name = "gemvbench"
+path = "src/gemvbench.rs"

@@ -455,6 +455,55 @@ kernel void gemv_t(
     }
 }
 
+kernel void gemv_sg_t(
+    device const float* X   [[buffer(0)]],
+    device const float* W   [[buffer(1)]],
+    device float*       OUT [[buffer(2)]],
+    constant uint&      K   [[buffer(3)]],
+    constant uint&      N   [[buffer(4)]],
+    constant int4&      ap  [[buffer(5)]],
+    constant int4&      bp  [[buffer(6)]],
+    constant int&       co  [[buffer(7)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tptg [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    const uint CS = NCOLG_FC;
+    uint sgs = tptg / 32;
+    uint cidx = lane % CS;
+    uint kslice = lane / CS;
+    uint KS = 32 / CS;
+    uint n0 = (tgid * sgs * CS + sgid * CS + cidx) * 4;
+    int xo = ap.x, xs = ap.y;
+    int wo = bp.x, ws = bp.y;
+    float4 acc = float4(0.0);
+    bool vec_ok = (n0 + 4 <= N) && (ws % 4 == 0) && ((wo + int(n0)) % 4 == 0);
+    if (vec_ok) {
+        device const float4* W4 = (device const float4*)(W + wo + n0);
+        uint ws4 = uint(ws) / 4u;
+        for (uint k = kslice; k < K; k += KS) {
+            acc += X[xo + int(k) * xs] * W4[k * ws4];
+        }
+    } else if (n0 < N) {
+        for (uint k = kslice; k < K; k += KS) {
+            float xv = X[xo + int(k) * xs];
+            for (uint j = 0; j < 4; ++j) {
+                if (n0 + j < N) acc[j] += xv * W[wo + int(k) * ws + int(n0 + j)];
+            }
+        }
+    }
+    for (uint sh = 16; sh >= CS; sh /= 2) {
+        acc += simd_shuffle_down(acc, sh);
+    }
+    if (kslice == 0 && n0 < N) {
+        for (uint j = 0; j < 4; ++j) {
+            if (n0 + j < N) OUT[co + n0 + j] = acc[j];
+        }
+    }
+}
+
 kernel void gemv_rows_t(
     device const float* X   [[buffer(0)]],
     device const float* W   [[buffer(1)]],

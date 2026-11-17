@@ -9,7 +9,7 @@ pub struct CuteMetal {
     pipelines: HashMap<&'static str, ComputePipelineState>,
     lib: metal::Library,
     gemv_variants: std::cell::RefCell<HashMap<(u32, u32), ComputePipelineState>>,
-    gemv_choice: std::cell::RefCell<HashMap<(usize, usize, bool), (u32, u32, u64)>>,
+    gemv_choice: std::cell::RefCell<HashMap<(usize, usize, bool), (u32, u32, u32, u64)>>,
     rows_variants: std::cell::RefCell<HashMap<u32, ComputePipelineState>>,
 }
 
@@ -44,6 +44,64 @@ impl CuteMetal {
         let _ = me.gemv_pipeline(4, 8);
         let _ = me.gemv_rows_pipeline(4);
         me
+    }
+
+    pub fn gemv_sg_pipeline(&self, csplit: u32) -> ComputePipelineState {
+        let key = (100 + csplit, 0);
+        if let Some(p) = self.gemv_variants.borrow().get(&key) {
+            return p.clone();
+        }
+        let fcv = metal::FunctionConstantValues::new();
+        let four = 4u32;
+        fcv.set_constant_value_at_index(
+            &four as *const u32 as *const c_void,
+            metal::MTLDataType::UInt,
+            0,
+        );
+        fcv.set_constant_value_at_index(
+            &csplit as *const u32 as *const c_void,
+            metal::MTLDataType::UInt,
+            1,
+        );
+        let f = self.lib.get_function("gemv_sg_t", Some(fcv)).expect("gemv_sg_t");
+        let p = self
+            .device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("gemv_sg_t pipeline");
+        self.gemv_variants.borrow_mut().insert(key, p.clone());
+        p
+    }
+
+    fn encode_gemv_sg(
+        &self,
+        cb: &metal::CommandBufferRef,
+        pipe: &ComputePipelineState,
+        a: &Buffer,
+        b: &Buffer,
+        c: &Buffer,
+        k: usize,
+        n: usize,
+        xap: [i32; 4],
+        wbp: [i32; 4],
+        co: i32,
+        csplit: u32,
+        tg: u64,
+    ) {
+        let enc = cb.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipe);
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(c), 0);
+        let (ku, nu) = (k as u32, n as u32);
+        enc.set_bytes(3, 4, &ku as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nu as *const u32 as *const c_void);
+        enc.set_bytes(5, 16, xap.as_ptr() as *const c_void);
+        enc.set_bytes(6, 16, wbp.as_ptr() as *const c_void);
+        enc.set_bytes(7, 4, &co as *const i32 as *const c_void);
+        let cols_per_tg = (tg / 32) * csplit as u64 * 4;
+        let tgs = (n as u64).div_ceil(cols_per_tg);
+        enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(tg, 1, 1));
+        enc.end_encoding();
     }
 
     pub fn gemv_rows_pipeline(&self, vec: u32) -> ComputePipelineState {
@@ -177,13 +235,11 @@ impl CuteMetal {
         let wscratch = self.alloc_bytes(bytes * copies);
         let out_scratch = self.alloc_bytes(n * 4);
         let xap = [0, ap[2], 0, 0];
-        let mut best = (f64::INFINITY, (4u32, 8u32, 256u64));
-        let candidates: Vec<(u32, u32, u64)> = if rows {
+        let mut best = (f64::INFINITY, (0u32, 4u32, 8u32, 256u64));
+        let candidates: Vec<(u32, u32, u32, u64)> = if rows {
             let mut v = Vec::new();
             for tg in [128u64, 256u64] {
-                for vec in [4u32] {
-                    v.push((vec, 1, tg));
-                }
+                v.push((2u32, 4u32, 1u32, tg));
             }
             v
         } else {
@@ -195,13 +251,16 @@ impl CuteMetal {
                         continue;
                     }
                     for vec in [4u32, 8u32] {
-                        v.push((vec, ncolg, tg));
+                        v.push((0u32, vec, ncolg, tg));
                     }
+                }
+                for csplit in [4u32, 8u32, 16u32] {
+                    v.push((1u32, 4u32, csplit, tg));
                 }
             }
             v
         };
-        for (vec, ncolg, tg) in candidates {
+        for (kind, vec, ncolg, tg) in candidates {
             let run = |iters: usize, offs: usize| {
                 let cb = self.queue.new_command_buffer();
                 for it in 0..iters {
@@ -212,12 +271,19 @@ impl CuteMetal {
                     } else {
                         [off as i32 / 4, bp[1], 1, 0]
                     };
-                    if rows {
-                        let pipe = self.gemv_rows_pipeline(vec);
-                        self.encode_gemv_rows(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, tg);
-                    } else {
-                        let pipe = self.gemv_pipeline(vec, ncolg);
-                        self.encode_gemv_t(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, vec, ncolg, tg);
+                    match kind {
+                        2 => {
+                            let pipe = self.gemv_rows_pipeline(vec);
+                            self.encode_gemv_rows(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, tg);
+                        }
+                        1 => {
+                            let pipe = self.gemv_sg_pipeline(ncolg);
+                            self.encode_gemv_sg(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, ncolg, tg);
+                        }
+                        _ => {
+                            let pipe = self.gemv_pipeline(vec, ncolg);
+                            self.encode_gemv_t(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, vec, ncolg, tg);
+                        }
                     }
                 }
                 cb.commit();
@@ -228,15 +294,16 @@ impl CuteMetal {
             run(4, 2);
             let ms = t.elapsed().as_secs_f64() * 1e3 / 4.0;
             if ms < best.0 {
-                best = (ms, (vec, ncolg, tg));
+                best = (ms, (kind, vec, ncolg, tg));
             }
         }
         if std::env::var("GEMVTUNE").is_ok() {
             eprintln!(
-                "gemv tune K={k} N={n} rows={rows}: vec={} ncolg={} tg={} ({:.3} ms, {:.1} GB/s)",
+                "gemv tune K={k} N={n} rows={rows}: kind={} vec={} p={} tg={} ({:.3} ms, {:.1} GB/s)",
                 best.1.0,
                 best.1.1,
                 best.1.2,
+                best.1.3,
                 best.0,
                 bytes as f64 / (best.0 / 1e3) / 1e9
             );
@@ -340,14 +407,19 @@ impl CuteMetal {
     ) {
         if m == 1 && bp[2] == 1 && cp[2] == 1 {
             let choice = self.gemv_choice.borrow().get(&(k, n, true)).copied();
-            let (vec, ncolg, tg) = choice.unwrap_or((4, 8, 256));
-            let pipe = self.gemv_pipeline(vec, ncolg);
+            let (kind, vec, p2, tg) = choice.unwrap_or((0, 4, 8, 256));
             let xap = [ap[0], ap[2], 0, 0];
             let wbp = [bp[0], bp[1], 0, 0];
-            self.encode_gemv_t(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], vec, ncolg, tg);
+            if kind == 1 {
+                let pipe = self.gemv_sg_pipeline(p2);
+                self.encode_gemv_sg(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], p2, tg);
+            } else {
+                let pipe = self.gemv_pipeline(vec, p2);
+                self.encode_gemv_t(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], vec, p2, tg);
+            }
         } else if m == 1 && bp[1] == 1 && cp[2] == 1 {
             let choice = self.gemv_choice.borrow().get(&(k, n, false)).copied();
-            let (vec, _, tg) = choice.unwrap_or((4, 1, 256));
+            let (_, vec, _, tg) = choice.unwrap_or((2, 4, 1, 256));
             let pipe = self.gemv_rows_pipeline(vec);
             let xap = [ap[0], ap[2], 0, 0];
             let wbp = [bp[0], 1, bp[2], 0];

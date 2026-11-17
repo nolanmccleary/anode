@@ -1073,6 +1073,9 @@ impl<'g> Exec<'g> {
     }
 
     pub fn replay(&self) {
+        if std::env::var("ONEENC").is_ok() {
+            return self.replay_one_encoder();
+        }
         let cb = self.backend.owned_command_buffer();
         for t in self.tape.borrow().iter() {
             match t {
@@ -1554,6 +1557,71 @@ impl<'g> Exec<'g> {
                 ),
             }
         }
+    }
+
+    fn replay_one_encoder(&self) {
+        let cb = self.backend.owned_command_buffer();
+        let tape = self.tape.borrow();
+        let mut i = 0usize;
+        while i < tape.len() {
+            match &tape[i] {
+                Tape::Matmul { a, b, c, m, k, n, ap, bp, cp } => {
+                    self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                    i += 1;
+                }
+                _ => {
+                    let enc = cb.new_compute_command_encoder();
+                    while i < tape.len() {
+                        let written: &Buffer = match &tape[i] {
+                            Tape::Run1d { kernel, bufs, args, n } => {
+                                enc.set_compute_pipeline_state(self.backend.pipeline(kernel));
+                                for (kk, bb) in bufs.iter().enumerate() {
+                                    enc.set_buffer(kk as u64, Some(bb), 0);
+                                }
+                                for (slot, m) in args {
+                                    match m {
+                                        Meta(meta) => enc.set_bytes(*slot, 72, meta.as_ptr() as *const _),
+                                        Scalar(v) => enc.set_bytes(*slot, 4, v as *const u32 as *const _),
+                                        F32(v) => enc.set_bytes(*slot, 4, v as *const f32 as *const _),
+                                        Prog(p) => enc.set_bytes(*slot, 100, p.as_ptr() as *const _),
+                                        Spec(p) => enc.set_bytes(*slot, 32, p.as_ptr() as *const _),
+                                    }
+                                }
+                                let tg = 256u64.min((*n).max(1));
+                                enc.dispatch_threads(
+                                    metal::MTLSize::new((*n).max(1), 1, 1),
+                                    metal::MTLSize::new(tg, 1, 1),
+                                );
+                                if kernel.starts_with("xcopy") {
+                                    &bufs[1]
+                                } else {
+                                    bufs.last().unwrap()
+                                }
+                            }
+                            Tape::MetaOnly { kernel, bufs, meta, n } => {
+                                enc.set_compute_pipeline_state(self.backend.pipeline(kernel));
+                                for (kk, bb) in bufs.iter().enumerate() {
+                                    enc.set_buffer(kk as u64, Some(bb), 0);
+                                }
+                                enc.set_bytes(6, 72, meta.as_ptr() as *const _);
+                                let tg = 256u64.min((*n).max(1));
+                                enc.dispatch_threads(
+                                    metal::MTLSize::new((*n).max(1), 1, 1),
+                                    metal::MTLSize::new(tg, 1, 1),
+                                );
+                                bufs.last().unwrap()
+                            }
+                            Tape::Matmul { .. } => break,
+                        };
+                        enc.memory_barrier_with_resources(&[written]);
+                        i += 1;
+                    }
+                    enc.end_encoding();
+                }
+            }
+        }
+        cb.commit();
+        cb.wait_until_completed();
     }
 
     fn run_meta_only(&self, kernel: &'static str, bufs: &[&Buffer; 6], meta: [i32; 18], n: u64) {
