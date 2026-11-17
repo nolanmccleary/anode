@@ -1,6 +1,6 @@
-use eqtheory::affine_arm::AffineExec;
-use eqtheory::arena::{allocate_arena, read_f32, upload};
-use eqtheory::loaders;
+use eqtheory_baseline::affine_arm::AffineExec;
+use eqtheory_baseline::arena::{allocate_arena, read_f32, upload};
+use eqtheory_baseline::loaders;
 use luminal_metal::bindings::MetalBindings;
 use luminal_metal::MetalRuntime;
 use std::time::Instant;
@@ -15,7 +15,7 @@ fn main() {
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read_ids),
-        eqtheory::kernels::shared_registry(),
+        eqtheory_baseline::baseline_registry::shared_registry(),
     )
     .expect("load");
     let t0 = Instant::now();

@@ -1,4 +1,4 @@
-use eqtheory::loaders;
+use eqtheory_baseline::loaders;
 use luminal::bufferize::BufferNode;
 use luminal_metal::bindings::MetalBindings;
 use luminal_metal::MetalRuntime;
@@ -11,7 +11,7 @@ fn main() {
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read),
-        eqtheory::kernels::shared_registry(),
+        eqtheory_baseline::baseline_registry::shared_registry(),
     )
     .expect("load");
     rt.compile(&Default::default(), &Default::default()).expect("compile");

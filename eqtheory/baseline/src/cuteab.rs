@@ -1,7 +1,7 @@
-use eqtheory::affine_arm::AffineExec;
-use eqtheory::arena::{allocate_arena, read_f32, upload};
-use eqtheory::executor::Exec;
-use eqtheory::loaders::{self, ModelConfig};
+use eqtheory_baseline::affine_arm::AffineExec;
+use eqtheory_baseline::arena::{allocate_arena, read_f32, upload};
+use eqtheory_baseline::executor::Exec;
+use eqtheory_baseline::loaders::{self, ModelConfig};
 use luminal_metal::bindings::MetalBindings;
 use luminal_metal::MetalRuntime;
 use std::time::Instant;
@@ -79,7 +79,7 @@ fn run_config(name: &str, cfg: Option<ModelConfig>) {
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read_ids),
-        eqtheory::kernels::shared_registry(),
+        eqtheory_baseline::baseline_registry::shared_registry(),
     )
     .expect("load");
     let t1 = Instant::now();

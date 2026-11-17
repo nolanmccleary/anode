@@ -1,5 +1,5 @@
-use eqtheory::kernels::shared_registry;
-use eqtheory::loaders;
+use eqtheory_baseline::baseline_registry::shared_registry;
+use eqtheory_baseline::loaders;
 use luminal::bufferize::BufferNode;
 use luminal::logical_ir::FusionMode;
 use luminal_metal::bindings::MetalBindings;

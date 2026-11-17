@@ -1,5 +1,5 @@
-use eqtheory::executor::Exec;
-use eqtheory::loaders::{self, ModelConfig};
+use eqtheory_baseline::executor::Exec;
+use eqtheory_baseline::loaders::{self, ModelConfig};
 use std::io::Write;
 use std::path::Path;
 

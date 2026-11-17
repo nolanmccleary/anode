@@ -1,5 +1,5 @@
 use crate::cute_probe::{factor, probe};
-use crate::metal_backend::CuteMetal;
+use eqtheory::metal_backend::CuteMetal;
 use cute_layout::algebra::mapping::composition;
 use cute_layout::{IntTuple, Layout};
 use luminal::dtype::DType;
@@ -37,6 +37,7 @@ pub struct Exec<'g> {
     fuse_plan: HashMap<NodeIndex, Fused>,
     pub fused_chains: Cell<usize>,
     pub generic_ew_edges: Cell<usize>,
+    pub inplace_cache: bool,
     pub static_idx_folds: Cell<usize>,
     iota_host: HashMap<NodeIndex, Vec<i32>>,
 }
@@ -233,6 +234,7 @@ impl<'g> Exec<'g> {
             fuse_plan: HashMap::new(),
             fused_chains: Cell::new(0),
             generic_ew_edges: Cell::new(0),
+            inplace_cache: false,
             static_idx_folds: Cell::new(0),
             iota_host: HashMap::new(),
         }
@@ -587,142 +589,148 @@ impl<'g> Exec<'g> {
             if !matches!(self.g[pv_rs].op, LogicalOp::ReduceSum { .. }) {
                 continue;
             }
-            let v = *self
-                .operands(pv_mul)
-                .iter()
-                .find(|o| **o != vw)
-                .unwrap();
+            let v = *self.operands(pv_mul).iter().find(|o| **o != vw).unwrap();
             let dims = self.dims(qk_mul);
             let rank = dims.len();
             let hd_ax = rank - 1 - axis_from_end;
-            let varies = |me: &mut Self, id: NodeIndex, ax: usize| -> Option<bool> {
-                Some(me.axis_stride(id, ax)? != 0 && me.dims(id)[ax] != 1)
-            };
-            let (mut kv_ax, mut g_ax, mut ctx_ax) = (None, None, None);
-            let (mut a_is_q, mut ok) = (true, true);
+            let hdn = dims[hd_ax];
+            if hdn > 64 {
+                continue;
+            }
+            let mut kv_ax = None;
+            let mut a_only: Vec<usize> = Vec::new();
+            let mut b_only: Vec<usize> = Vec::new();
+            let mut ok = true;
             for ax in 0..rank {
                 if ax == hd_ax || dims[ax] == 1 {
                     continue;
                 }
-                let (Some(va), Some(vb)) = (
-                    varies(self, qk_ops[0], ax),
-                    varies(self, qk_ops[1], ax),
+                let (Some(sa), Some(sb)) = (
+                    self.axis_stride(qk_ops[0], ax),
+                    self.axis_stride(qk_ops[1], ax),
                 ) else {
                     ok = false;
                     break;
                 };
-                match (va, vb) {
+                match (sa != 0, sb != 0) {
                     (true, true) => {
                         if kv_ax.replace(ax).is_some() {
                             ok = false;
                             break;
                         }
                     }
-                    (true, false) => {
-                        if g_ax.is_none() {
-                            g_ax = Some(ax);
-                            a_is_q = true;
-                        } else if ctx_ax.is_none() {
-                            ctx_ax = Some(ax);
-                            a_is_q = false;
-                        } else {
-                            ok = false;
-                            break;
-                        }
-                    }
-                    (false, true) => {
-                        if ctx_ax.is_none() && g_ax.is_none() {
-                            ctx_ax = Some(ax);
-                            a_is_q = true;
-                        } else if ctx_ax.is_none() {
-                            ctx_ax = Some(ax);
-                        } else if g_ax.is_none() {
-                            g_ax = Some(ax);
-                        } else {
-                            ok = false;
-                            break;
-                        }
-                    }
+                    (true, false) => a_only.push(ax),
+                    (false, true) => b_only.push(ax),
                     (false, false) => {}
                 }
             }
-            let (Some(kv_ax), Some(g_ax), Some(ctx_ax)) = (kv_ax, g_ax, ctx_ax) else {
-                continue;
-            };
             if !ok {
                 continue;
             }
-            let (q_op, k_op) = if a_is_q {
-                (qk_ops[0], qk_ops[1])
-            } else {
-                (qk_ops[1], qk_ops[0])
+            let out_numel = numel(&self.dims(pv_rs));
+            let kvn = kv_ax.map(|ax| dims[ax]).unwrap_or(1);
+            let pick = |q_axes: &Vec<usize>, k_axes: &Vec<usize>| -> Option<(Vec<usize>, usize)> {
+                if k_axes.len() != 1 || q_axes.is_empty() || q_axes.len() > 2 {
+                    return None;
+                }
+                let prod: i64 = q_axes.iter().map(|a| dims[*a]).product();
+                (out_numel == kvn * prod * hdn).then(|| (q_axes.clone(), k_axes[0]))
             };
-            let (kvn, gn, ctxn, hdn) = (dims[kv_ax], dims[g_ax], dims[ctx_ax], dims[hd_ax]);
-            if ctxn > 8 {
-                continue;
-            }
-            let pv_dims = self.dims(pv_rs);
-            if numel(&pv_dims) != kvn * gn * hdn {
-                continue;
-            }
-            let st = |me: &mut Self, id: NodeIndex, ax: usize| me.axis_stride(id, ax);
-            let (Some(qkv), Some(qg), Some(qhd)) = (
+            let (q_op, k_op, q_axes, ctx_ax) =
+                if let Some((qa, ca)) = pick(&a_only, &b_only) {
+                    (qk_ops[0], qk_ops[1], qa, ca)
+                } else if let Some((qa, ca)) = pick(&b_only, &a_only) {
+                    (qk_ops[1], qk_ops[0], qa, ca)
+                } else {
+                    continue;
+                };
+            let (g_ax, s_ax) = match q_axes.len() {
+                1 => (q_axes[0], None),
+                _ => (q_axes[0], Some(q_axes[1])),
+            };
+            let (gn, sn, ctxn) = (
+                dims[g_ax],
+                s_ax.map(|a| dims[a]).unwrap_or(1),
+                dims[ctx_ax],
+            );
+            let st = |me: &mut Self, id: NodeIndex, ax: Option<usize>| -> Option<i64> {
+                match ax {
+                    Some(ax) => me.axis_stride(id, ax),
+                    None => Some(0),
+                }
+            };
+            let (Some(qkv), Some(qg), Some(qs), Some(qhd)) = (
                 st(self, q_op, kv_ax),
-                st(self, q_op, g_ax),
-                st(self, q_op, hd_ax),
+                st(self, q_op, Some(g_ax)),
+                st(self, q_op, s_ax),
+                st(self, q_op, Some(hd_ax)),
             ) else {
                 continue;
             };
             let (Some(kkv), Some(kctx), Some(khd)) = (
                 st(self, k_op, kv_ax),
-                st(self, k_op, ctx_ax),
-                st(self, k_op, hd_ax),
+                st(self, k_op, Some(ctx_ax)),
+                st(self, k_op, Some(hd_ax)),
             ) else {
                 continue;
             };
-            let pv_v_dims = self.dims(v);
-            let pvr = pv_v_dims.len();
+            let pvm_dims = self.dims(pv_mul);
+            let pvr = pvm_dims.len();
             let LogicalOp::ReduceSum { axis_from_end: pv_afe } = self.g[pv_rs].op else {
                 continue;
             };
             let pv_ctx_ax = pvr - 1 - pv_afe;
+            if pvm_dims[pv_ctx_ax] != ctxn {
+                continue;
+            }
             let mut pv_hd_ax = None;
             let mut pv_kv_ax = None;
-            let pvm_dims = self.dims(pv_mul);
             for ax in 0..pvr {
                 if ax == pv_ctx_ax || pvm_dims[ax] == 1 {
                     continue;
                 }
-                if pvm_dims[ax] == hdn && pv_hd_ax.is_none() {
-                    let sv = varies(self, vw, ax);
-                    if sv == Some(false) {
-                        pv_hd_ax = Some(ax);
-                        continue;
+                let sv = self.axis_stride(v, ax);
+                let sw = self.axis_stride(vw, ax);
+                match (sv.map(|x| x != 0), sw.map(|x| x != 0)) {
+                    (Some(true), Some(true)) => {
+                        if pv_kv_ax.replace(ax).is_some() {
+                            ok = false;
+                            break;
+                        }
                     }
-                }
-                if pvm_dims[ax] == kvn && pv_kv_ax.is_none() {
-                    pv_kv_ax = Some(ax);
+                    (Some(true), Some(false)) => {
+                        if pv_hd_ax.replace(ax).is_some() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
             }
-            let (Some(pv_hd_ax), Some(pv_kv_ax)) = (pv_hd_ax, pv_kv_ax) else {
+            if !ok {
                 continue;
-            };
+            }
+            let Some(pv_hd_ax) = pv_hd_ax else { continue };
+            if pvm_dims[pv_hd_ax] != hdn {
+                continue;
+            }
             let (Some(vkv), Some(vctx), Some(vhd)) = (
                 st(self, v, pv_kv_ax),
-                st(self, v, pv_ctx_ax),
-                st(self, v, pv_hd_ax),
+                st(self, v, Some(pv_ctx_ax)),
+                st(self, v, Some(pv_hd_ax)),
             ) else {
                 continue;
             };
-            let (Some(bkv), Some(bg), Some(bctx)) = (
+            let (Some(bkv), Some(bg), Some(bs), Some(bctx)) = (
                 st(self, bias, kv_ax),
-                st(self, bias, g_ax),
-                st(self, bias, ctx_ax),
+                st(self, bias, Some(g_ax)),
+                st(self, bias, s_ax),
+                st(self, bias, Some(ctx_ax)),
             ) else {
                 continue;
             };
-            let fits = |v: i64| i32::try_from(v).is_ok();
-            if ![qkv, qg, qhd, kkv, kctx, khd, vkv, vctx, vhd, bkv, bg, bctx]
+            let fits = |x: i64| i32::try_from(x).is_ok();
+            if ![qkv, qg, qs, qhd, kkv, kctx, khd, vkv, vctx, vhd, bkv, bg, bs, bctx]
                 .iter()
                 .all(|x| fits(*x))
             {
@@ -731,25 +739,28 @@ impl<'g> Exec<'g> {
             let mut params = [0i32; 25];
             params[0] = kvn as i32;
             params[1] = gn as i32;
-            params[2] = ctxn as i32;
-            params[3] = hdn as i32;
-            params[4] = 0;
-            params[5] = qkv as i32;
-            params[6] = qg as i32;
-            params[7] = qhd as i32;
-            params[8] = 0;
-            params[9] = kkv as i32;
-            params[10] = kctx as i32;
-            params[11] = khd as i32;
-            params[12] = 0;
-            params[13] = vkv as i32;
-            params[14] = vctx as i32;
-            params[15] = vhd as i32;
-            params[16] = 0;
-            params[17] = bkv as i32;
-            params[18] = bg as i32;
-            params[19] = bctx as i32;
-            params[20] = scale_bits;
+            params[2] = sn as i32;
+            params[3] = ctxn as i32;
+            params[4] = hdn as i32;
+            params[5] = 0;
+            params[6] = qkv as i32;
+            params[7] = qg as i32;
+            params[8] = qs as i32;
+            params[9] = qhd as i32;
+            params[10] = 0;
+            params[11] = kkv as i32;
+            params[12] = kctx as i32;
+            params[13] = khd as i32;
+            params[14] = 0;
+            params[15] = vkv as i32;
+            params[16] = vctx as i32;
+            params[17] = vhd as i32;
+            params[18] = 0;
+            params[19] = bkv as i32;
+            params[20] = bg as i32;
+            params[21] = bs as i32;
+            params[22] = bctx as i32;
+            params[23] = scale_bits;
             for n in [qk_mul, qk_rs, scores, fin, vw, pv_mul] {
                 self.fuse_skip.insert(n);
             }
@@ -794,22 +805,67 @@ impl<'g> Exec<'g> {
             if !varies(&al, ax) || !varies(&bl, ax) {
                 continue;
             }
-            let (mut m_axes, mut n_axes) = (Vec::new(), Vec::new());
+            let (mut m_axes, mut n_axes, mut b_axes) = (Vec::new(), Vec::new(), Vec::new());
             let mut ok = true;
             for axis in 0..rank {
                 if axis == ax {
                     continue;
                 }
                 match (varies(&al, axis), varies(&bl, axis)) {
-                    (true, true) => {
-                        ok = false;
-                        break;
-                    }
+                    (true, true) => b_axes.push(axis),
                     (_, true) => n_axes.push(axis),
-                    _ => m_axes.push(axis),
+                    _ => {
+                        if dims[axis] != 1 {
+                            m_axes.push(axis)
+                        }
+                    }
                 }
             }
+            if b_axes.len() > 4 {
+                ok = false;
+            }
             if !ok || m_axes.iter().any(|ma| n_axes.iter().any(|na| ma > na)) {
+                continue;
+            }
+            let out_dims_full = self.dims(rs);
+            if !b_axes.is_empty() {
+                let innermost_b = *b_axes.iter().max().unwrap();
+                let mn_min = m_axes.iter().chain(n_axes.iter()).min().copied();
+                if let Some(mn) = mn_min {
+                    if innermost_b > mn {
+                        continue;
+                    }
+                }
+                assert_eq!(
+                    out_dims_full.len() + 1,
+                    rank,
+                    "reduce drops exactly the contraction axis"
+                );
+            }
+            let mut batch = vec![b_axes.len() as i32];
+            let mut nbatch = 1i64;
+            let mut bfit = true;
+            for axis in &b_axes {
+                let (Some(abs_), Some(bbs)) = (
+                    group_stride(axis_modes(&al, *axis, rank)),
+                    group_stride(axis_modes(&bl, *axis, rank)),
+                ) else {
+                    bfit = false;
+                    break;
+                };
+                let oax = if *axis < ax { *axis } else { *axis - 1 };
+                let cstride: i64 = out_dims_full[oax + 1..].iter().product();
+                if [abs_, bbs, cstride, dims[*axis]]
+                    .iter()
+                    .any(|v| i32::try_from(*v).is_err())
+                {
+                    bfit = false;
+                    break;
+                }
+                batch.extend([dims[*axis] as i32, abs_ as i32, bbs as i32, cstride as i32]);
+                nbatch *= dims[*axis];
+            }
+            if !bfit {
                 continue;
             }
             let collect = |l: &Layout, axes: &[usize]| -> Vec<(i64, i64)> {
@@ -849,6 +905,8 @@ impl<'g> Exec<'g> {
                     n,
                     ap: [0, ars as i32, acs as i32, 0],
                     bp: [0, brs as i32, bcs as i32, 0],
+                    batch,
+                    nbatch,
                 },
             );
         }
@@ -1058,7 +1116,7 @@ impl<'g> Exec<'g> {
                         }
                         "silu_mul" => 3 * n * 4,
                         "ew_chain" => 3 * n * 4,
-                        "attn_decode" => 4 * n,
+                        "attn_decode" | "attn_online" => 4 * n,
                         "softmax_rows" => 2 * n * 4,
                         other => panic!("traffic for {other}"),
                     }
@@ -1067,7 +1125,9 @@ impl<'g> Exec<'g> {
                     let n = *n as usize;
                     n * 4 * 2 + n * 4 * 2
                 }
-                Tape::Matmul { m, k, n, .. } => (m * k + k * n + m * n) * 4,
+                Tape::Matmul { m, k, n, nbatch, .. } => {
+                    (*nbatch as usize) * (m * k + k * n + m * n) * 4
+                }
             })
             .sum()
     }
@@ -1115,8 +1175,12 @@ impl<'g> Exec<'g> {
                     );
                     enc.end_encoding();
                 }
-                Tape::Matmul { a, b, c, m, k, n, ap, bp, cp } => {
-                    self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                Tape::Matmul { a, b, c, m, k, n, ap, bp, cp, batch, nbatch } => {
+                    if *nbatch > 1 {
+                        self.backend.bmm_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
+                    } else {
+                        self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                    }
                 }
             }
         }
@@ -1182,15 +1246,15 @@ impl<'g> Exec<'g> {
                 let (kb, _) = self.operand_meta(k);
                 let (vb, _) = self.operand_meta(v);
                 let (bb, _) = self.operand_meta(bias);
-                let heads = (params[0] * params[1]) as u64;
+                let jobs = (params[0] * params[1] * params[2]) as u64;
                 let out = self.alloc(n as usize * 4);
                 let bufs: Vec<Buffer> = [&qb, &kb, &vb, &bb]
                     .iter()
                     .map(|x| self.vals[*x].buf.clone())
                     .collect();
-                let threads = heads.div_ceil(8) * 256;
+                let threads = jobs.div_ceil(8) * 256;
                 self.run1d(
-                    "attn_decode",
+                    "attn_online",
                     &[&bufs[0], &bufs[1], &bufs[2], &bufs[3], &out],
                     &[(5, Prog(params))],
                     threads,
@@ -1266,7 +1330,9 @@ impl<'g> Exec<'g> {
                 );
             }
         }
-        self.plan_fusions();
+        if std::env::var("GENERAL_ONLY").is_err() {
+            self.plan_fusions();
+        }
         self.plan_matmuls();
         let order = toposort(&self.g, None).expect("logical graph is a DAG");
         for id in order {
@@ -1280,9 +1346,13 @@ impl<'g> Exec<'g> {
             if let Some(plan) = self.mm_plan.get(&id).cloned() {
                 let dims = self.dims(id);
                 let n_out = numel(&dims);
-                assert_eq!(n_out, plan.m * plan.n, "matmul out extents");
+                assert_eq!(n_out, plan.m * plan.n * plan.nbatch, "matmul out extents");
                 let out = self.alloc(n_out as usize * 4);
-                if plan.m == 1 && (plan.bp[2] == 1 || plan.bp[1] == 1) {
+                if plan.nbatch == 1
+                    && plan.m == 1
+                    && (plan.bp[2] == 1 || plan.bp[1] == 1)
+                    && std::env::var("GENERAL_ONLY").is_err()
+                {
                     self.backend.tune_gemv(
                         plan.k as usize,
                         plan.n as usize,
@@ -1302,6 +1372,8 @@ impl<'g> Exec<'g> {
                     ap: plan.ap,
                     bp: plan.bp,
                     cp: [0, plan.n as i32, 1, 0],
+                    batch: plan.batch.clone(),
+                    nbatch: plan.nbatch,
                 });
                 self.dispatches.set(self.dispatches.get() + 1);
                 self.matmuls_paired.set(self.matmuls_paired.get() + 1);
@@ -1501,9 +1573,18 @@ impl<'g> Exec<'g> {
                     let idims = self.dims(ops[0]);
                     assert_eq!(idims, dims, "scatter init matches out");
                     let imeta = meta_of(&iacc, idims.len()).expect("scatter init meta");
-                    let out = self.alloc(n as usize * 4);
+                    let alias = self.inplace_cache
+                        && ibase == ops[0]
+                        && matches!(self.g[ibase].op, LogicalOp::Input { .. });
+                    let out = if alias {
+                        self.vals[&ibase].buf.clone()
+                    } else {
+                        self.alloc(n as usize * 4)
+                    };
                     let ibuf = self.vals[&ibase].buf.clone();
-                    self.run_xcopy("xcopy_f", &ibuf, &out, &[], n, imeta, flat_meta(n), [0; 8], [0; 8]);
+                    if !alias {
+                        self.run_xcopy("xcopy_f", &ibuf, &out, &[], n, imeta, flat_meta(n), [0; 8], [0; 8]);
+                    }
                     let src = *ops.last().unwrap();
                     let (sbase, smeta) = self.operand_meta(src);
                     let sdims = self.dims(src);
@@ -1565,8 +1646,12 @@ impl<'g> Exec<'g> {
         let mut i = 0usize;
         while i < tape.len() {
             match &tape[i] {
-                Tape::Matmul { a, b, c, m, k, n, ap, bp, cp } => {
-                    self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                Tape::Matmul { a, b, c, m, k, n, ap, bp, cp, batch, nbatch } => {
+                    if *nbatch > 1 {
+                        self.backend.bmm_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
+                    } else {
+                        self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                    }
                     i += 1;
                 }
                 _ => {
@@ -1634,6 +1719,36 @@ impl<'g> Exec<'g> {
         self.dispatches.set(self.dispatches.get() + 1);
     }
 
+    pub fn poke_i32(&self, id: NodeIndex, vals: &[i32]) {
+        let b = &self.vals[&id].buf;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vals.as_ptr() as *const u8,
+                b.contents() as *mut u8,
+                vals.len() * 4,
+            );
+        }
+    }
+
+    pub fn poke_f32(&self, id: NodeIndex, vals: &[f32]) {
+        let b = &self.vals[&id].buf;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                vals.as_ptr() as *const u8,
+                b.contents() as *mut u8,
+                vals.len() * 4,
+            );
+        }
+    }
+
+    pub fn find_zero_scalar_iotas(&self) -> Vec<NodeIndex> {
+        self.iota_host
+            .iter()
+            .filter(|(id, h)| h.len() == 1 && h[0] == 0 && self.dims(**id) == vec![1])
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub fn read_f32(&mut self, id: NodeIndex) -> Vec<f32> {
         let before = self.tape.borrow().len();
         let v = self.contiguous_val(id);
@@ -1670,6 +1785,8 @@ enum Tape {
         ap: [i32; 4],
         bp: [i32; 4],
         cp: [i32; 4],
+        batch: Vec<i32>,
+        nbatch: i64,
     },
 }
 
@@ -1691,6 +1808,8 @@ struct MatmulPlan {
     n: i64,
     ap: [i32; 4],
     bp: [i32; 4],
+    batch: Vec<i32>,
+    nbatch: i64,
 }
 
 fn axis_modes(layout: &Layout, ax: usize, rank: usize) -> Vec<(i64, i64)> {

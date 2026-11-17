@@ -1,5 +1,5 @@
-use eqtheory::arena::{allocate_arena, read_f32, upload};
-use eqtheory::loaders;
+use eqtheory_baseline::arena::{allocate_arena, read_f32, upload};
+use eqtheory_baseline::loaders;
 use luminal_metal::bindings::MetalBindings;
 use luminal_metal::{harness_search_options, metal_registry, MetalRuntime};
 use std::time::Instant;

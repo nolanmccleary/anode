@@ -1,4 +1,4 @@
-use eqtheory::loaders;
+use eqtheory_baseline::loaders;
 use luminal::bufferize::BufferNode;
 use luminal::logical_ir::FusionMode;
 use luminal_metal::bindings::MetalBindings;
@@ -17,7 +17,7 @@ fn plan_labels(fusion: FusionMode) -> BTreeMap<String, usize> {
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read),
-        eqtheory::kernels::shared_registry(),
+        eqtheory_baseline::baseline_registry::shared_registry(),
     )
     .expect("load");
 

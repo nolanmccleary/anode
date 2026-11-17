@@ -1,5 +1,5 @@
-use eqtheory::arena::{allocate_arena, read_f32, upload};
-use eqtheory::loaders;
+use eqtheory_baseline::arena::{allocate_arena, read_f32, upload};
+use eqtheory_baseline::loaders;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::logical_ir::FusionMode;
@@ -28,7 +28,7 @@ fn run(cute_lowering: bool, fusion: FusionMode) -> R {
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read),
-        eqtheory::kernels::shared_registry(),
+        eqtheory_baseline::baseline_registry::shared_registry(),
     )
     .expect("load");
 

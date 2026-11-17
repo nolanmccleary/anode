@@ -50,7 +50,72 @@ fn main() {
     ];
 
     let kernels_allow = ["kernels.rs", "metal_backend.rs"];
-    let loader_allow = ["loaders.rs"];
+    let loader_allow = ["native_model.rs"];
+
+    let allowed_pointwise = ["Exp2", "Recip", "Sqrt", "Rsqrt", "Relu", "Step", "CastIdentity"];
+    let ksrc = fs::read_to_string("src/kernels.rs").unwrap_or_default();
+    let enum_body = |name: &str| -> Vec<String> {
+        let tag = format!("pub enum {name} {{");
+        let start = ksrc.find(&tag).map(|i| i + tag.len()).unwrap_or_else(|| {
+            panic!("  [node-types] src/kernels.rs must declare `pub enum {name}` — the e-graph vocabulary is fixed")
+        });
+        let end = start + ksrc[start..].find('}').unwrap();
+        ksrc[start..end]
+            .split(',')
+            .map(|v| v.split('(').next().unwrap().trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    };
+    let node_types = enum_body("NodeType");
+    if node_types != ["Move", "Pointwise"] {
+        panic!(
+            "  [node-types] NodeType must be exactly {{Move, Pointwise}} — got {node_types:?}. The e-graph vocabulary is LAYOUT MOVES (default; non-injective write = contraction over the fixed (+,x) semiring) plus POINTWISE NONLINEARITIES. No other node type may exist; compose, don't invent."
+        );
+    }
+    for v in enum_body("Pointwise") {
+        if !allowed_pointwise.contains(&v.as_str()) {
+            panic!(
+                "  [node-types] Pointwise variant `{v}` is not in the closed nonlinearity list {allowed_pointwise:?}. Extending the list is a conscious act: add it here WITH justification that it is a true pointwise nonlinearity, not a composition."
+            );
+        }
+    }
+
+    let manifest = fs::read_to_string("Cargo.toml").unwrap_or_default();
+    if manifest.contains("luminal-ai") {
+        panic!(
+            "  [verticalized] Cargo.toml references the luminal-ai org — the engine pins must point upstream (egraphs-good/egglog); nothing of ours may depend on their repos."
+        );
+    }
+
+    for f in fs::read_dir("src").unwrap() {
+        let path = f.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        if text.to_lowercase().contains("luminal") {
+            panic!(
+                "  [verticalized] {} mentions `luminal` — src/ is the system, derived entirely from the CuTe axioms; comparison code that consumes Luminal lives only in baseline/",
+                path.display()
+            );
+        }
+    }
+
+    let fused_allowlist = ["softmax_rows", "rmsnorm_row", "attn_decode", "attn_online"];
+    let kernels_src = fs::read_to_string("src/kernels.rs").unwrap_or_default();
+    let kdef = ["kernel", "void "].join(" ");
+    for block in kernels_src.split(&kdef).skip(1) {
+        let name: String = block.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+        let body_end = block.find(&kdef).unwrap_or(block.len());
+        let body = &block[..body_end];
+        let transcendental = ["exp(", "exp2(", "sqrt("].iter().any(|t| body.contains(t));
+        let reduction = body.contains("for ") && body.contains("+=");
+        if transcendental && reduction && !fused_allowlist.contains(&name.as_str()) {
+            panic!(
+                "  [no-hamfisted-kernels] src/kernels.rs kernel `{name}` fuses a reduction with a nonlinearity but is not a registered optimization member. Fused kernels must (1) be added to the allowlist in build.rs AND (2) have a working primitive-only path proven by tests/general_path.rs — never be the sole implementation of an op."
+            );
+        }
+    }
 
     let mut bad: Vec<String> = Vec::new();
     for f in &files {

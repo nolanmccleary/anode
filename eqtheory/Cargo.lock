@@ -389,18 +389,50 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 [[package]]
 name = "egglog"
 version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "chrono",
+ "clap",
+ "csv",
+ "dyn-clone",
+ "egglog-add-primitive 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-ast 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-bridge 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-core-relations 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-reports 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egraph-serialize",
+ "enum-map",
+ "env_logger",
+ "hashbrown 0.16.1",
+ "im-rc",
+ "indexmap",
+ "log",
+ "mimalloc",
+ "num",
+ "ordered-float",
+ "rustc-hash",
+ "serde_json",
+ "smallvec",
+ "thiserror",
+ "web-time",
+]
+
+[[package]]
+name = "egglog"
+version = "2.0.0"
 source = "git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
 dependencies = [
  "chrono",
  "clap",
  "csv",
  "dyn-clone",
- "egglog-add-primitive",
- "egglog-ast",
- "egglog-bridge",
- "egglog-core-relations",
- "egglog-numeric-id",
- "egglog-reports",
+ "egglog-add-primitive 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-ast 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-bridge 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-core-relations 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-reports 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "egraph-serialize",
  "enum-map",
  "env_logger",
@@ -421,10 +453,27 @@ dependencies = [
 [[package]]
 name = "egglog-add-primitive"
 version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "egglog-add-primitive"
+version = "2.0.0"
 source = "git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "egglog-ast"
+version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "ordered-float",
 ]
 
 [[package]]
@@ -438,15 +487,38 @@ dependencies = [
 [[package]]
 name = "egglog-bridge"
 version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "anyhow",
+ "dyn-clone",
+ "egglog-concurrency 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-core-relations 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-reports 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-union-find 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "log",
+ "num-rational",
+ "once_cell",
+ "ordered-float",
+ "smallvec",
+ "thiserror",
+ "web-time",
+]
+
+[[package]]
+name = "egglog-bridge"
+version = "2.0.0"
 source = "git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
 dependencies = [
  "anyhow",
  "dyn-clone",
- "egglog-concurrency",
- "egglog-core-relations",
- "egglog-numeric-id",
- "egglog-reports",
- "egglog-union-find",
+ "egglog-concurrency 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-core-relations 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-reports 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-union-find 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "hashbrown 0.16.1",
  "indexmap",
  "log",
@@ -461,13 +533,53 @@ dependencies = [
 [[package]]
 name = "egglog-concurrency"
 version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "arc-swap",
+ "bumpalo",
+ "crossbeam",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "smallvec",
+]
+
+[[package]]
+name = "egglog-concurrency"
+version = "2.0.0"
 source = "git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
 dependencies = [
  "arc-swap",
  "bumpalo",
  "crossbeam",
- "egglog-numeric-id",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "smallvec",
+]
+
+[[package]]
+name = "egglog-core-relations"
+version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "anyhow",
+ "bumpalo",
+ "crossbeam",
+ "crossbeam-queue",
+ "dashmap",
+ "dyn-clone",
+ "egglog-concurrency 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-reports 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-union-find 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "fixedbitset 0.5.9",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "log",
+ "num",
+ "once_cell",
+ "rand 0.9.5",
+ "rustc-hash",
+ "smallvec",
+ "thiserror",
+ "web-time",
 ]
 
 [[package]]
@@ -481,10 +593,10 @@ dependencies = [
  "crossbeam-queue",
  "dashmap",
  "dyn-clone",
- "egglog-concurrency",
- "egglog-numeric-id",
- "egglog-reports",
- "egglog-union-find",
+ "egglog-concurrency 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-reports 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-union-find 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "fixedbitset 0.5.9",
  "hashbrown 0.16.1",
  "indexmap",
@@ -501,7 +613,26 @@ dependencies = [
 [[package]]
 name = "egglog-numeric-id"
 version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+
+[[package]]
+name = "egglog-numeric-id"
+version = "2.0.0"
 source = "git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+
+[[package]]
+name = "egglog-reports"
+version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "clap",
+ "hashbrown 0.16.1",
+ "indexmap",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "web-time",
+]
 
 [[package]]
 name = "egglog-reports"
@@ -520,11 +651,21 @@ dependencies = [
 [[package]]
 name = "egglog-union-find"
 version = "2.0.0"
+source = "git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
+dependencies = [
+ "crossbeam",
+ "egglog-concurrency 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+]
+
+[[package]]
+name = "egglog-union-find"
+version = "2.0.0"
 source = "git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c#3787810fa259efc45237eecd98d7914a6b02256c"
 dependencies = [
  "crossbeam",
- "egglog-concurrency",
- "egglog-numeric-id",
+ "egglog-concurrency 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-numeric-id 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
 ]
 
 [[package]]
@@ -596,7 +737,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "cute-layout",
- "egglog",
+ "egglog 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "metal",
+ "objc",
+]
+
+[[package]]
+name = "eqtheory-baseline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cute-layout",
+ "egglog 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "eqtheory",
  "luminal",
  "luminal_metal",
  "metal",
@@ -1011,8 +1164,8 @@ dependencies = [
  "as-any",
  "colored",
  "dyn-clone",
- "egglog",
- "egglog-ast",
+ "egglog 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
+ "egglog-ast 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "egraph-serialize",
  "fixedbitset 0.5.9",
  "float8",
@@ -1067,7 +1220,7 @@ dependencies = [
 name = "luminal_snapshot"
 version = "0.1.0"
 dependencies = [
- "egglog",
+ "egglog 2.0.0 (git+https://github.com/luminal-ai/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "egraph-serialize",
  "indexmap",
  "once_cell",

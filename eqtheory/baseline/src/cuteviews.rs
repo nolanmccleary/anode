@@ -1,6 +1,6 @@
 use eqtheory::cute_egraph::{extract, saturate, Frame};
-use eqtheory::loaders::{self, ModelConfig};
-use eqtheory::cute_probe::probe;
+use eqtheory_baseline::loaders::{self, ModelConfig};
+use eqtheory_baseline::cute_probe::probe;
 use luminal::logical_ir::LogicalOp;
 use luminal::prelude::petgraph::Direction;
 use std::collections::{BTreeMap, BTreeSet};

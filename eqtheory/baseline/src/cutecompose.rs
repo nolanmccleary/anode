@@ -1,7 +1,7 @@
 use cute_layout::algebra::mapping::{coalesce, composition};
 use cute_layout::{IntTuple, Layout};
-use eqtheory::cute_probe::probe;
-use eqtheory::loaders::{self, ModelConfig};
+use eqtheory_baseline::cute_probe::probe;
+use eqtheory_baseline::loaders::{self, ModelConfig};
 use luminal::logical_ir::{LogicalOp, MapEntry};
 use luminal::prelude::petgraph::Direction;
 use luminal::prelude::NodeIndex;
@@ -39,7 +39,7 @@ fn colex_strides(dims: &[i64]) -> Vec<i64> {
 }
 
 fn eval_entry(e: &MapEntry, coords: &[i64]) -> Option<i64> {
-    eqtheory::cute_probe::eval_entry(e, coords)
+    eqtheory_baseline::cute_probe::eval_entry(e, coords)
 }
 
 fn fused_offset(chain: &[(Vec<MapEntry>, Vec<i64>)], base_strides: &[i64], coord: &[i64]) -> Option<i64> {

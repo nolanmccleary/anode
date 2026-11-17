@@ -1,10 +1,10 @@
-pub mod affine_arm;
-pub mod arena;
+pub mod atoms;
 pub mod cute_egraph;
 pub mod cute_match;
-pub mod cute_probe;
-pub mod executor;
+pub mod ir;
 pub mod kernels;
-pub mod loaders;
 pub mod metal_backend;
+pub mod native_exec;
+pub mod native_fuse;
+pub mod native_model;
 pub mod views;

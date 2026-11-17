@@ -1,4 +1,4 @@
-use eqtheory::loaders::{self, ModelConfig};
+use eqtheory_baseline::loaders::{self, ModelConfig};
 use luminal::prelude::petgraph::Direction;
 use std::collections::BTreeMap;
 

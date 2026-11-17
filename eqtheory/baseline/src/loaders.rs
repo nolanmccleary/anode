@@ -34,6 +34,7 @@ pub struct Loaded {
     pub graph: Graph,
     pub outputs: Vec<GraphTensor>,
     fixed: Vec<(NodeIndex, Vec<i32>)>,
+    zero_f32: Vec<NodeIndex>,
 }
 
 pub fn load(cfg: &ModelConfig) -> Loaded {
@@ -76,6 +77,58 @@ pub fn load(cfg: &ModelConfig) -> Loaded {
             (gather.id, vec![0, 1]),
             (scatter.id, vec![1]),
         ],
+        zero_f32: Vec::new(),
+    }
+}
+
+pub struct SessionLoaded {
+    pub loaded: Loaded,
+    pub ids_id: NodeIndex,
+    pub scatter_id: NodeIndex,
+}
+
+pub fn load_session(cfg: &ModelConfig, seq: usize, ctx: usize, ids_vals: Vec<i32>) -> SessionLoaded {
+    let mut cx = Graph::new();
+    let model = MiniLlama3::new(
+        cfg.vocab,
+        cfg.d,
+        cfg.ff,
+        cfg.n_heads,
+        cfg.n_kv_heads,
+        cfg.layers,
+        &mut cx,
+    );
+    let head_dim = cfg.d / cfg.n_heads;
+    let kv_dim = cfg.n_kv_heads * head_dim;
+    let ids = cx.tensor(vec![seq], DType::Int);
+    let caches: Vec<(GraphTensor, GraphTensor)> = (0..cfg.layers)
+        .map(|_| {
+            (
+                cx.tensor(vec![ctx, kv_dim], DType::F32),
+                cx.tensor(vec![ctx, kv_dim], DType::F32),
+            )
+        })
+        .collect();
+    let gather = cx.tensor(vec![ctx], DType::Int);
+    let scatter = cx.tensor(vec![seq], DType::Int);
+    let (logits, cache_outputs) =
+        model.forward(ids, &caches, gather, scatter, IntExpr::from(0usize));
+    let mut outputs = vec![logits];
+    outputs.extend(cache_outputs.into_iter().flat_map(|(kk, vv)| [kk, vv]));
+    let zero_f32 = caches.iter().flat_map(|(k, v)| [k.id, v.id]).collect();
+    SessionLoaded {
+        loaded: Loaded {
+            graph: cx,
+            outputs,
+            fixed: vec![
+                (ids.id, ids_vals),
+                (gather.id, (0..ctx as i32).collect()),
+                (scatter.id, (0..seq as i32).collect()),
+            ],
+            zero_f32,
+        },
+        ids_id: ids.id,
+        scatter_id: scatter.id,
     }
 }
 
@@ -98,6 +151,7 @@ pub fn load_deep_views(n: usize, depth: usize) -> Loaded {
         graph: cx,
         outputs: vec![out],
         fixed: Vec::new(),
+        zero_f32: Vec::new(),
     }
 }
 
@@ -123,6 +177,9 @@ impl Loaded {
             .map(|(seed, spec)| {
                 let hb = if let Some(v) = fixed.get(&spec.id) {
                     HostBuffer::from((*v).clone())
+                } else if self.zero_f32.contains(&spec.id) {
+                    let n: usize = spec.dims.iter().map(|d| d.to_usize().unwrap()).product();
+                    HostBuffer::from(vec![0f32; n])
                 } else {
                     let n: usize = spec.dims.iter().map(|d| d.to_usize().unwrap()).product();
                     match spec.dtype {

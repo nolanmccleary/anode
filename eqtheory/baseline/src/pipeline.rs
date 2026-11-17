@@ -1,5 +1,5 @@
-use eqtheory::arena::{allocate_arena, read_f32, upload};
-use eqtheory::loaders;
+use eqtheory_baseline::arena::{allocate_arena, read_f32, upload};
+use eqtheory_baseline::loaders;
 use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal_metal::bindings::MetalBindings;

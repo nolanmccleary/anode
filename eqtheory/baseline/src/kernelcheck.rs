@@ -1,5 +1,5 @@
-use eqtheory::kernels::{EqClass, KERNELS};
-use eqtheory::loaders::{self, ModelConfig};
+use eqtheory::kernels::{NodeType, Pointwise, KERNELS};
+use eqtheory_baseline::loaders::{self, ModelConfig};
 use eqtheory::metal_backend::CuteMetal;
 use std::collections::BTreeSet;
 
@@ -15,24 +15,24 @@ fn cfg() -> ModelConfig {
     }
 }
 
-fn required(constructor: &str) -> &'static [EqClass] {
+fn required(constructor: &str) -> &'static [NodeType] {
     match constructor {
         "LogicalTensorInputLit" => &[],
-        "LogicalConstant" => &[EqClass::Fill],
-        "LogicalAdd" => &[EqClass::Add],
-        "LogicalMul" => &[EqClass::Matmul, EqClass::MulEw],
-        "LogicalReduceSum" => &[EqClass::Matmul, EqClass::ReduceSum],
-        "LogicalReduceMax" => &[EqClass::ReduceMax],
-        "LogicalRecip" => &[EqClass::Recip],
-        "LogicalSqrt" => &[EqClass::Sqrt],
-        "LogicalExp2" => &[EqClass::Exp2],
-        "LogicalIota" => &[EqClass::Iota],
-        "LogicalCast" => &[EqClass::CastI2F],
-        "LogicalRoundingCast" => &[EqClass::Round],
-        "LogicalGather" => &[EqClass::Gather],
-        "LogicalScatter" => &[EqClass::Scatter],
-        "LogicalLessThan" => &[EqClass::LessThan],
-        "LogicalIndexMapApply" => &[EqClass::Copy],
+        "LogicalConstant" => &[NodeType::Move],
+        "LogicalAdd" => &[NodeType::Move],
+        "LogicalMul" => &[NodeType::Move],
+        "LogicalReduceSum" => &[NodeType::Move],
+        "LogicalReduceMax" => &[NodeType::Move],
+        "LogicalRecip" => &[NodeType::Pointwise(Pointwise::Recip)],
+        "LogicalSqrt" => &[NodeType::Pointwise(Pointwise::Sqrt)],
+        "LogicalExp2" => &[NodeType::Pointwise(Pointwise::Exp2)],
+        "LogicalIota" => &[NodeType::Move],
+        "LogicalCast" => &[NodeType::Pointwise(Pointwise::CastIdentity)],
+        "LogicalRoundingCast" => &[NodeType::Pointwise(Pointwise::CastIdentity)],
+        "LogicalGather" => &[NodeType::Move],
+        "LogicalScatter" => &[NodeType::Move],
+        "LogicalLessThan" => &[NodeType::Pointwise(Pointwise::Step)],
+        "LogicalIndexMapApply" => &[NodeType::Move],
         other => panic!("constructor {other} has NO shared-kernel mapping — extend kernels.rs"),
     }
 }
@@ -48,7 +48,7 @@ fn main() {
     let loaded = loaders::load(&cfg());
     luminal::logical_ir::set_cute_lowering(false);
 
-    let have: BTreeSet<EqClass> = KERNELS.iter().map(|(_, c)| *c).collect();
+    let have: BTreeSet<NodeType> = KERNELS.iter().map(|(_, c)| *c).collect();
     let mut ctors: BTreeSet<&str> = BTreeSet::new();
     for id in loaded.graph.logical.petgraph().node_indices() {
         ctors.insert(loaded.graph.logical.petgraph()[id].op.constructor());

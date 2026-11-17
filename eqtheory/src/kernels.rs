@@ -1,90 +1,82 @@
-use anyhow::{bail, Result};
-use luminal::buffer_tensor_ir::{BufferTensorIrOp, OpSlotNames};
-use luminal::dtype::PlanDtype;
-use luminal::egglog_snippet::{EgglogSnippet, SpliceCategory};
-use luminal::layout_ir::{
-    AliasInfo, Bufferizable, ExtractionSite, LayoutIrOp, OpMatcher, Sharing, ToDps,
-};
-use luminal_metal::kernels::{layout_read_index, CodegenCtx, Coords, KernelOp, KernelSource};
-use luminal_metal::symbolic::Expr;
-use luminal_metal::{MetalOpInterface, RegisteredOp};
-
 pub const TILE: u64 = 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-pub enum EqClass {
-    Matmul,
-    Copy,
-    Gather,
-    Relu,
-    Add,
-    Softmax,
-    MulEw,
+pub enum Pointwise {
+    Exp2,
     Recip,
     Sqrt,
-    Exp2,
-    Iota,
-    CastI2F,
-    Round,
-    Scatter,
-    ReduceSum,
-    ReduceMax,
-    LessThan,
-    Fill,
-    CastB2F,
     Rsqrt,
+    Relu,
+    Step,
+    CastIdentity,
 }
 
-pub const KERNELS: &[(&str, EqClass)] = &[
-    ("tiled_matmul", EqClass::Matmul),
-    ("materialize", EqClass::Copy),
-    ("gather3", EqClass::Gather),
-    ("relu", EqClass::Relu),
-    ("add2", EqClass::Add),
-    ("softmax_rows", EqClass::Softmax),
-    ("mul2", EqClass::MulEw),
-    ("recip1", EqClass::Recip),
-    ("sqrt1", EqClass::Sqrt),
-    ("exp2_1", EqClass::Exp2),
-    ("iota_i", EqClass::Iota),
-    ("cast_i2f", EqClass::CastI2F),
-    ("round_f", EqClass::Round),
-    ("scatter_rows", EqClass::Scatter),
-    ("reduce_sum_rows", EqClass::ReduceSum),
-    ("reduce_max_rows", EqClass::ReduceMax),
-    ("less_than_i", EqClass::LessThan),
-    ("fill1", EqClass::Fill),
-    ("copy_strided", EqClass::Copy),
-    ("copy_strided_i", EqClass::Copy),
-    ("add_strided", EqClass::Add),
-    ("mul_strided", EqClass::MulEw),
-    ("recip_o", EqClass::Recip),
-    ("sqrt_o", EqClass::Sqrt),
-    ("exp2_o", EqClass::Exp2),
-    ("cast_b2f", EqClass::CastB2F),
-    ("gather4", EqClass::Gather),
-    ("scatter4", EqClass::Scatter),
-    ("reduce_sum_axis", EqClass::ReduceSum),
-    ("reduce_max_axis", EqClass::ReduceMax),
-    ("sqrt_s", EqClass::Sqrt),
-    ("recip_s", EqClass::Recip),
-    ("exp2_s", EqClass::Exp2),
-    ("rsqrt_s", EqClass::Rsqrt),
-    ("gemv_n4", EqClass::Matmul),
-    ("rmsnorm_row", EqClass::MulEw),
-    ("silu_mul", EqClass::MulEw),
-    ("ew_chain", EqClass::MulEw),
-    ("attn_decode", EqClass::Softmax),
-    ("xcopy_f", EqClass::Copy),
-    ("xcopy_i", EqClass::Copy),
-    ("xcopy_i2f", EqClass::CastI2F),
-    ("lt_strided", EqClass::LessThan),
-    ("reduce_sum_l", EqClass::ReduceSum),
-    ("reduce_max_l", EqClass::ReduceMax),
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum NodeType {
+    Move,
+    Pointwise(Pointwise),
+}
+
+pub const KERNELS: &[(&str, NodeType)] = &[
+    ("tiled_matmul", NodeType::Move),
+    ("bmm", NodeType::Move),
+    ("materialize", NodeType::Move),
+    ("gather3", NodeType::Move),
+    ("relu", NodeType::Pointwise(Pointwise::Relu)),
+    ("add2", NodeType::Move),
+    ("softmax_rows", NodeType::Move),
+    ("mul2", NodeType::Move),
+    ("recip1", NodeType::Pointwise(Pointwise::Recip)),
+    ("sqrt1", NodeType::Pointwise(Pointwise::Sqrt)),
+    ("exp2_1", NodeType::Pointwise(Pointwise::Exp2)),
+    ("iota_i", NodeType::Move),
+    ("cast_i2f", NodeType::Pointwise(Pointwise::CastIdentity)),
+    ("round_f", NodeType::Pointwise(Pointwise::CastIdentity)),
+    ("scatter_rows", NodeType::Move),
+    ("reduce_sum_rows", NodeType::Move),
+    ("reduce_max_rows", NodeType::Move),
+    ("less_than_i", NodeType::Pointwise(Pointwise::Step)),
+    ("fill1", NodeType::Move),
+    ("copy_strided", NodeType::Move),
+    ("copy_strided_i", NodeType::Move),
+    ("add_strided", NodeType::Move),
+    ("mul_strided", NodeType::Move),
+    ("recip_o", NodeType::Pointwise(Pointwise::Recip)),
+    ("sqrt_o", NodeType::Pointwise(Pointwise::Sqrt)),
+    ("exp2_o", NodeType::Pointwise(Pointwise::Exp2)),
+    ("cast_b2f", NodeType::Pointwise(Pointwise::CastIdentity)),
+    ("gather4", NodeType::Move),
+    ("scatter4", NodeType::Move),
+    ("reduce_sum_axis", NodeType::Move),
+    ("reduce_max_axis", NodeType::Move),
+    ("sqrt_s", NodeType::Pointwise(Pointwise::Sqrt)),
+    ("recip_s", NodeType::Pointwise(Pointwise::Recip)),
+    ("exp2_s", NodeType::Pointwise(Pointwise::Exp2)),
+    ("rsqrt_s", NodeType::Pointwise(Pointwise::Rsqrt)),
+    ("gemv_n4", NodeType::Move),
+    ("rmsnorm_row", NodeType::Move),
+    ("silu_mul", NodeType::Move),
+    ("ew_chain", NodeType::Move),
+    ("attn_decode", NodeType::Move),
+    ("attn_online", NodeType::Move),
+    ("xcopy_f", NodeType::Move),
+    ("xcopy_i", NodeType::Move),
+    ("xcopy_i2f", NodeType::Pointwise(Pointwise::CastIdentity)),
+    ("lt_strided", NodeType::Pointwise(Pointwise::Step)),
+    ("reduce_sum_l", NodeType::Move),
+    ("reduce_max_l", NodeType::Move),
+];
+
+pub const TEMPLATE_KERNELS: &[(&str, NodeType)] = &[
+    ("gemm_sg", NodeType::Move),
+    ("gemv_t", NodeType::Move),
+    ("gemv_rows_t", NodeType::Move),
+    ("gemv_sg_t", NodeType::Move),
 ];
 
 pub const KERNEL_SOURCE: &str = r#"
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 constant uint TILE = 16;
@@ -341,6 +333,53 @@ kernel void tiled_matmul(
     if (row < M && col < N) C[co + int(row)*crs + int(col)*ccs] = acc;
 }
 
+kernel void bmm(
+    device const float* A   [[buffer(0)]],
+    device const float* B   [[buffer(1)]],
+    device float*       C   [[buffer(2)]],
+    constant uint&      M   [[buffer(3)]],
+    constant uint&      K   [[buffer(4)]],
+    constant uint&      N   [[buffer(5)]],
+    constant int4&      ap  [[buffer(6)]],
+    constant int4&      bp  [[buffer(7)]],
+    constant int4&      cp  [[buffer(8)]],
+    constant int*       bat [[buffer(9)]],
+    uint3 tgp [[threadgroup_position_in_grid]],
+    uint3 tid3 [[thread_position_in_threadgroup]])
+{
+    threadgroup float As[TILE][TILE];
+    threadgroup float Bs[TILE][TILE];
+    uint2 tid = uint2(tid3.x, tid3.y);
+    long ao = ap.x, bo = bp.x, co = cp.x;
+    int nax = bat[0];
+    int r = int(tgp.z);
+    for (int k = 0; k < nax; ++k) {
+        int sz = bat[1 + 4 * k];
+        int i = r % sz;
+        r /= sz;
+        ao += (long)i * bat[2 + 4 * k];
+        bo += (long)i * bat[3 + 4 * k];
+        co += (long)i * bat[4 + 4 * k];
+    }
+    int ars = ap.y, acs = ap.z;
+    int brs = bp.y, bcs = bp.z;
+    int crs = cp.y, ccs = cp.z;
+    uint row = tgp.y * TILE + tid.y;
+    uint col = tgp.x * TILE + tid.x;
+    float acc = 0.0;
+    uint ntiles = (K + TILE - 1) / TILE;
+    for (uint t = 0; t < ntiles; ++t) {
+        uint aK = t * TILE + tid.x;
+        uint bK = t * TILE + tid.y;
+        As[tid.y][tid.x] = (row < M && aK < K) ? A[ao + int(row) * ars + int(aK) * acs] : 0.0;
+        Bs[tid.y][tid.x] = (bK < K && col < N) ? B[bo + int(bK) * brs + int(col) * bcs] : 0.0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = 0; e < TILE; ++e) acc += As[tid.y][e] * Bs[e][tid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (row < M && col < N) C[co + int(row) * crs + int(col) * ccs] = acc;
+}
+
 kernel void gather3(
     device const float* SRC [[buffer(0)]],
     device float*       DST [[buffer(1)]],
@@ -398,6 +437,14 @@ kernel void add2(
 }
 
 constant uint VEC_FC [[function_constant(0)]];
+constant uint GSGM_FC [[function_constant(4)]];
+constant uint GSGN_FC [[function_constant(5)]];
+constant uint GATM_FC [[function_constant(6)]];
+constant uint GATN_FC [[function_constant(7)]];
+constant uint ATTN_SPLIT_RAW [[function_constant(2)]];
+constant uint ATTN_VEC_RAW [[function_constant(3)]];
+constant uint ATTN_SPLIT = is_function_constant_defined(ATTN_SPLIT_RAW) ? ATTN_SPLIT_RAW : 1;
+constant uint ATTN_VEC = is_function_constant_defined(ATTN_VEC_RAW) ? ATTN_VEC_RAW : 1;
 constant uint NCOLG_FC [[function_constant(1)]];
 
 kernel void gemv_t(
@@ -752,6 +799,155 @@ kernel void ew_chain(
     OUT[gid] = v;
 }
 
+kernel void gemm_sg(
+    device const float* A    [[buffer(0)]],
+    device const float* B    [[buffer(1)]],
+    device float*       C    [[buffer(2)]],
+    constant int4&      dims [[buffer(3)]],
+    constant int4&      ap   [[buffer(4)]],
+    constant int4&      bp   [[buffer(5)]],
+    constant int4&      cp   [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    int k = dims.y;
+    int sgm = int(sgid) / int(GSGN_FC);
+    int sgn = int(sgid) % int(GSGN_FC);
+    int i0 = int(tgid.y) * int(GSGM_FC * GATM_FC * 8u) + sgm * int(GATM_FC) * 8;
+    int j0 = int(tgid.x) * int(GSGN_FC * GATN_FC * 8u) + sgn * int(GATN_FC) * 8;
+    long am = ap.y, ak = ap.z;
+    long bk = bp.y, bn = bp.z;
+    bool at = ak != 1;
+    bool bt = bn != 1;
+    ulong lda = ulong(at ? ak : am);
+    ulong ldb = ulong(bt ? bn : bk);
+    simdgroup_float8x8 acc[4][4];
+    for (uint i = 0; i < GATM_FC; ++i)
+        for (uint j = 0; j < GATN_FC; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (int kk = 0; kk < k; kk += 8) {
+        simdgroup_float8x8 af[4];
+        simdgroup_float8x8 bf[4];
+        for (uint i = 0; i < GATM_FC; ++i) {
+            long base = long(ap.x) + (long(i0) + long(i) * 8) * am + long(kk) * ak;
+            simdgroup_load(af[i], A + base, lda, ulong2(0, 0), at);
+        }
+        for (uint j = 0; j < GATN_FC; ++j) {
+            long base = long(bp.x) + long(kk) * bk + (long(j0) + long(j) * 8) * bn;
+            simdgroup_load(bf[j], B + base, ldb, ulong2(0, 0), bt);
+        }
+        for (uint i = 0; i < GATM_FC; ++i)
+            for (uint j = 0; j < GATN_FC; ++j)
+                simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+    }
+    long cm = cp.y;
+    for (uint i = 0; i < GATM_FC; ++i)
+        for (uint j = 0; j < GATN_FC; ++j) {
+            long base = long(cp.x) + (long(i0) + long(i) * 8) * cm + long(j0) + long(j) * 8;
+            simdgroup_store(acc[i][j], C + base, ulong(cm), ulong2(0, 0));
+        }
+}
+
+kernel void attn_online(
+    device const float* Q    [[buffer(0)]],
+    device const float* Kc   [[buffer(1)]],
+    device const float* Vc   [[buffer(2)]],
+    device const float* BIAS [[buffer(3)]],
+    device float*       OUT  [[buffer(4)]],
+    constant int*       p    [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    int KV = p[0], G = p[1], S = p[2], CTX = p[3], HD = p[4];
+    uint jptg = 8 / ATTN_SPLIT;
+    int job = int(tgid * jptg + sgid / ATTN_SPLIT);
+    uint sgj = sgid % ATTN_SPLIT;
+    int total = KV * G * S;
+    bool valid = job < total;
+    float m = -INFINITY;
+    float l = 0.0;
+    float acc0 = 0.0;
+    float acc1 = 0.0;
+    int e0 = int(lane);
+    int e1 = int(lane) + 32;
+    float scale = as_type<float>(p[23]);
+    if (valid) {
+        int s = job % S;
+        int head = job / S;
+        int kv = head / G;
+        int g = head % G;
+        int qoff = p[5] + kv * p[6] + g * p[7] + s * p[8];
+        int koff = p[10] + kv * p[11];
+        int voff = p[14] + kv * p[15];
+        int boff = p[18] + kv * p[19] + g * p[20] + s * p[21];
+        int chunk = (CTX + int(ATTN_SPLIT) - 1) / int(ATTN_SPLIT);
+        int c0 = int(sgj) * chunk;
+        int cend = min(CTX, c0 + chunk);
+        for (int c = c0; c < cend; ++c) {
+            float part = 0.0;
+            if (ATTN_VEC == 4) {
+                device const float4* Q4 = (device const float4*)(Q + qoff);
+                device const float4* K4 = (device const float4*)(Kc + koff + c * p[12]);
+                for (int e4 = int(lane); e4 < HD / 4; e4 += 32) {
+                    float4 qv = Q4[e4];
+                    float4 kw = K4[e4];
+                    part += qv.x * kw.x + qv.y * kw.y + qv.z * kw.z + qv.w * kw.w;
+                }
+            } else {
+                for (int e = int(lane); e < HD; e += 32) {
+                    part += Q[qoff + e * p[9]] * Kc[koff + c * p[12] + e * p[13]];
+                }
+            }
+            float dot = simd_sum(part);
+            float x = dot * scale + BIAS[boff + c * p[22]];
+            float mn = max(m, x);
+            float corr = exp(m - mn);
+            float pr = exp(x - mn);
+            l = l * corr + pr;
+            float v0 = e0 < HD ? Vc[voff + c * p[16] + e0 * p[17]] : 0.0;
+            float v1 = e1 < HD ? Vc[voff + c * p[16] + e1 * p[17]] : 0.0;
+            acc0 = acc0 * corr + pr * v0;
+            acc1 = acc1 * corr + pr * v1;
+            m = mn;
+        }
+    }
+    if (ATTN_SPLIT == 1) {
+        if (!valid) return;
+        float inv = 1.0f / l;
+        int ob = job * HD;
+        if (e0 < HD) OUT[ob + e0] = acc0 * inv;
+        if (e1 < HD) OUT[ob + e1] = acc1 * inv;
+        return;
+    }
+    threadgroup float ms[8];
+    threadgroup float ls[8];
+    threadgroup float accs[8 * 64];
+    if (lane == 0) {
+        ms[sgid] = m;
+        ls[sgid] = l;
+    }
+    if (e0 < HD) accs[sgid * 64 + e0] = acc0;
+    if (e1 < HD) accs[sgid * 64 + e1] = acc1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!valid || sgj != 0) return;
+    float M = -INFINITY;
+    for (uint i = 0; i < ATTN_SPLIT; ++i) M = max(M, ms[sgid + i]);
+    float L = 0.0;
+    float o0 = 0.0;
+    float o1 = 0.0;
+    for (uint i = 0; i < ATTN_SPLIT; ++i) {
+        float w = exp(ms[sgid + i] - M);
+        L += ls[sgid + i] * w;
+        if (e0 < HD) o0 += accs[(sgid + i) * 64 + e0] * w;
+        if (e1 < HD) o1 += accs[(sgid + i) * 64 + e1] * w;
+    }
+    float inv = 1.0f / L;
+    int ob = job * HD;
+    if (e0 < HD) OUT[ob + e0] = o0 * inv;
+    if (e1 < HD) OUT[ob + e1] = o1 * inv;
+}
+
 kernel void attn_decode(
     device const float* Q    [[buffer(0)]],
     device const float* Kc   [[buffer(1)]],
@@ -996,139 +1192,3 @@ kernel void softmax_rows(
     for (uint j = 0; j < cols; ++j) row[j] /= s;
 }
 "#;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RsqrtFunctional;
-
-impl OpSlotNames for RsqrtFunctional {
-    fn operand_name(&self, operand: usize) -> String {
-        match operand {
-            0 => "input".to_string(),
-            _ => format!("in{operand}"),
-        }
-    }
-}
-
-impl BufferTensorIrOp for RsqrtFunctional {
-    fn label(&self) -> &str {
-        "RsqrtFunctionalGeneric"
-    }
-}
-
-impl Bufferizable for RsqrtFunctional {}
-
-impl ToDps for RsqrtFunctional {
-    fn to_dps(&self) -> Option<Box<dyn LayoutIrOp>> {
-        Some(Box::new(RsqrtFunctionalDps))
-    }
-}
-
-impl LayoutIrOp for RsqrtFunctional {}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RsqrtFunctionalDps;
-
-impl OpSlotNames for RsqrtFunctionalDps {
-    fn operand_name(&self, operand: usize) -> String {
-        match operand {
-            0 => "input".to_string(),
-            1 => "dest0".to_string(),
-            _ => format!("in{operand}"),
-        }
-    }
-}
-
-impl BufferTensorIrOp for RsqrtFunctionalDps {
-    fn runtime_interface(&self) -> Option<&dyn std::any::Any> {
-        Some(MetalOpInterface::kernel::<Self>())
-    }
-
-    fn label(&self) -> &str {
-        "RsqrtFunctionalGeneric"
-    }
-
-    fn operand_reads_memory(&self, operand: usize) -> bool {
-        operand != 1
-    }
-}
-
-impl Bufferizable for RsqrtFunctionalDps {
-    fn alias_info(&self) -> Vec<AliasInfo> {
-        vec![AliasInfo {
-            operand: 1,
-            result: 0,
-            sharing: Sharing::Must,
-        }]
-    }
-}
-
-impl ToDps for RsqrtFunctionalDps {
-    fn to_dps(&self) -> Option<Box<dyn LayoutIrOp>> {
-        None
-    }
-}
-
-impl LayoutIrOp for RsqrtFunctionalDps {}
-
-impl KernelOp for RsqrtFunctionalDps {
-    fn codegen(&self, ctx: &CodegenCtx) -> Result<Vec<KernelSource>> {
-        if ctx.operand_dtypes[0] != PlanDtype::F32 || ctx.dest_dtypes[0] != PlanDtype::F32 {
-            bail!("rsqrt fused kernel is F32 only");
-        }
-        let out_dims = &ctx.dest_dims[0];
-        let n = out_dims
-            .iter()
-            .cloned()
-            .reduce(|a, b| a * b)
-            .unwrap_or_else(|| Expr::from(1usize));
-        let layout = ctx.operand_layout(0);
-        let (code, idx) =
-            layout_read_index("a", layout, out_dims, Coords::FlatIndex { prefix: "c" })?;
-        if !code.is_empty() || idx != "i" {
-            bail!("rsqrt fused kernel requires a contiguous operand");
-        }
-        let source = format!(
-            "kernel void k(device const float* a, device float* out, device const long* params, uint gid [[thread_position_in_grid]]) {{\n    const ulong n = {n};\n    ulong i = gid;\n    if (i < n) out[i] = 1.0f / sqrt(a[i]);\n}}"
-        );
-        Ok(vec![KernelSource::plain(source, n)])
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RsqrtFunctionalMatcher;
-
-impl OpMatcher for RsqrtFunctionalMatcher {
-    fn egglog_constructor(&self) -> &'static str {
-        "LayoutTensorOpRsqrtFunctionalGeneric"
-    }
-
-    fn snippets(&self) -> Vec<EgglogSnippet> {
-        vec![
-            EgglogSnippet {
-                category: SpliceCategory::LayoutOpConstructors,
-                text: include_str!("rsqrt_constructor.egg"),
-            },
-            EgglogSnippet {
-                category: SpliceCategory::Match,
-                text: include_str!("rsqrt_match.egg"),
-            },
-        ]
-    }
-
-    fn metadata_slots(&self) -> &'static [(&'static str, usize)] {
-        &[("layout", 1)]
-    }
-
-    fn extract(&self, _site: &ExtractionSite<'_>) -> Box<dyn LayoutIrOp> {
-        Box::new(RsqrtFunctional)
-    }
-}
-
-pub fn shared_registry() -> Vec<RegisteredOp> {
-    let mut reg = luminal_metal::metal_registry();
-    reg.push(RegisteredOp::new(
-        Box::new(RsqrtFunctionalMatcher),
-        Box::new(RsqrtFunctional),
-    ));
-    reg
-}

@@ -1,5 +1,5 @@
 use crate::cute_probe::factor;
-use crate::metal_backend::CuteMetal;
+use eqtheory::metal_backend::CuteMetal;
 use luminal::bufferize::{BufferId, BufferNode};
 use luminal::dtype::DType;
 use luminal::prelude::petgraph::algo::toposort;

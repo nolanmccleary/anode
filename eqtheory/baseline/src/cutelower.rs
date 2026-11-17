@@ -1,5 +1,5 @@
 use eqtheory::cute_egraph::{extract, saturate, Frame};
-use eqtheory::loaders::{self, ModelConfig};
+use eqtheory_baseline::loaders::{self, ModelConfig};
 use luminal::dtype::DType;
 use std::collections::BTreeMap;
 
