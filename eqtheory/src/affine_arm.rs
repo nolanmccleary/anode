@@ -724,6 +724,16 @@ impl AffineExec {
                         let nn: i64 = n_axes.iter().map(|x| dims[*x]).product();
                         let k = dims[ax];
                         assert_eq!((m * nn) as usize, out_span(0), "gemm out span");
+                        if m == 1 && (bcs == 1 || brs == 1) {
+                            self.backend.tune_gemv(
+                                k as usize,
+                                nn as usize,
+                                self.buf(&reads[0]),
+                                self.buf(&reads[1]),
+                                [0, ars as i32, acs as i32, 0],
+                                [0, brs as i32, bcs as i32, 0],
+                            );
+                        }
                         self.tape.push(Tape::Matmul {
                             a: self.buf(&reads[0]).clone(),
                             b: self.buf(&reads[1]).clone(),
@@ -1181,7 +1191,7 @@ impl AffineExec {
                     enc.end_encoding();
                 }
                 Tape::Matmul { a, b, c, m, k, n, ap, bp, cp } => {
-                    self.backend.matmul_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                    self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
                 }
             }
         }

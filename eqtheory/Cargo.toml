@@ -96,3 +96,11 @@ path = "src/affinerun.rs"
 [[bin]]
 name = "cuteab"
 path = "src/cuteab.rs"
+
+[[bin]]
+name = "tmbench"
+path = "src/tmbench.rs"
+
+[[bin]]
+name = "export_model"
+path = "src/export_model.rs"

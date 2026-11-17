@@ -70,6 +70,16 @@ pub const KERNELS: &[(&str, EqClass)] = &[
     ("recip_s", EqClass::Recip),
     ("exp2_s", EqClass::Exp2),
     ("rsqrt_s", EqClass::Rsqrt),
+    ("gemv_n4", EqClass::Matmul),
+    ("rmsnorm_row", EqClass::MulEw),
+    ("silu_mul", EqClass::MulEw),
+    ("ew_chain", EqClass::MulEw),
+    ("xcopy_f", EqClass::Copy),
+    ("xcopy_i", EqClass::Copy),
+    ("xcopy_i2f", EqClass::CastI2F),
+    ("lt_strided", EqClass::LessThan),
+    ("reduce_sum_l", EqClass::ReduceSum),
+    ("reduce_max_l", EqClass::ReduceMax),
 ];
 
 pub const KERNEL_SOURCE: &str = r#"
@@ -384,6 +394,359 @@ kernel void add2(
     uint j = gid.x;
     if (i >= rows || j >= cols) return;
     C[i*cols + j] = A[i*cols + j] + B[bp.x + int(i)*bp.y + int(j)*bp.z];
+}
+
+constant uint VEC_FC [[function_constant(0)]];
+constant uint NCOLG_FC [[function_constant(1)]];
+
+kernel void gemv_t(
+    device const float* X   [[buffer(0)]],
+    device const float* W   [[buffer(1)]],
+    device float*       OUT [[buffer(2)]],
+    constant uint&      K   [[buffer(3)]],
+    constant uint&      N   [[buffer(4)]],
+    constant int4&      ap  [[buffer(5)]],
+    constant int4&      bp  [[buffer(6)]],
+    constant int&       co  [[buffer(7)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tptg [[threads_per_threadgroup]])
+{
+    const uint VEC = VEC_FC;
+    const uint NC = NCOLG_FC;
+    uint TG = tptg;
+    uint KS = TG / NC;
+    uint cg = tid % NC;
+    uint ks = tid / NC;
+    uint n0 = (tgid * NC + cg) * VEC;
+    int xo = ap.x, xs = ap.y;
+    int wo = bp.x, ws = bp.y;
+    threadgroup float4 part[512];
+    uint nv4 = VEC / 4;
+    float4 acc[2] = {float4(0.0), float4(0.0)};
+    bool vec_ok = (n0 + VEC <= N) && (ws % 4 == 0) && ((wo + int(n0)) % 4 == 0);
+    if (vec_ok) {
+        device const float4* W4 = (device const float4*)(W + wo + n0);
+        uint ws4 = uint(ws) / 4u;
+        for (uint k = ks; k < K; k += KS) {
+            float xv = X[xo + int(k) * xs];
+            for (uint v = 0; v < nv4; ++v) acc[v] += xv * W4[k * ws4 + v];
+        }
+    } else if (n0 < N) {
+        for (uint k = ks; k < K; k += KS) {
+            float xv = X[xo + int(k) * xs];
+            for (uint j = 0; j < VEC; ++j) {
+                if (n0 + j < N) acc[j / 4][j % 4] += xv * W[wo + int(k) * ws + int(n0 + j)];
+            }
+        }
+    }
+    for (uint v = 0; v < nv4; ++v) part[tid * 2 + v] = acc[v];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0 && n0 < N) {
+        float4 tot[2] = {float4(0.0), float4(0.0)};
+        for (uint j = 0; j < KS; ++j) {
+            uint t = j * NC + cg;
+            for (uint v = 0; v < nv4; ++v) tot[v] += part[t * 2 + v];
+        }
+        for (uint j = 0; j < VEC; ++j) {
+            if (n0 + j < N) OUT[co + n0 + j] = tot[j / 4][j % 4];
+        }
+    }
+}
+
+kernel void gemv_rows_t(
+    device const float* X   [[buffer(0)]],
+    device const float* W   [[buffer(1)]],
+    device float*       OUT [[buffer(2)]],
+    constant uint&      K   [[buffer(3)]],
+    constant uint&      N   [[buffer(4)]],
+    constant int4&      ap  [[buffer(5)]],
+    constant int4&      bp  [[buffer(6)]],
+    constant int&       co  [[buffer(7)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tptg [[threads_per_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint VEC = VEC_FC;
+    uint rptg = tptg / 32;
+    uint r = tgid * rptg + tid / 32;
+    if (r >= N) return;
+    int xo = ap.x, xs = ap.y;
+    int wo = bp.x, rs = bp.z;
+    long base = wo + (long)r * rs;
+    float acc = 0.0;
+    bool vec_ok = (VEC == 4) && (base % 4 == 0) && (K % 4 == 0) && (xs == 1);
+    if (vec_ok) {
+        device const float4* W4 = (device const float4*)(W + base);
+        device const float4* X4 = (device const float4*)(X + xo);
+        for (uint k4 = lane; k4 < K / 4; k4 += 32) {
+            float4 w = W4[k4];
+            float4 x = X4[k4];
+            acc += w.x * x.x + w.y * x.y + w.z * x.z + w.w * x.w;
+        }
+    } else {
+        for (uint k = lane; k < K; k += 32) {
+            acc += X[xo + int(k) * xs] * W[base + k];
+        }
+    }
+    float total = simd_sum(acc);
+    if (lane == 0) OUT[co + r] = total;
+}
+
+kernel void gemv_n4(
+    device const float* X   [[buffer(0)]],
+    device const float* W   [[buffer(1)]],
+    device float*       OUT [[buffer(2)]],
+    constant uint&      K   [[buffer(3)]],
+    constant uint&      N   [[buffer(4)]],
+    constant int4&      ap  [[buffer(5)]],
+    constant int4&      bp  [[buffer(6)]],
+    constant int&       co  [[buffer(7)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup float4 partial[256];
+    uint c4 = tid % 8;
+    uint ks = tid / 8;
+    uint n = (tgid * 8 + c4) * 4;
+    int xo = ap.x, xs = ap.y;
+    int wo = bp.x, ws = bp.y;
+    float4 acc = float4(0.0);
+    if (n < N) {
+        bool vec = (n + 4 <= N) && (ws % 4 == 0) && ((wo + int(n)) % 4 == 0);
+        if (vec) {
+            device const float4* W4 = (device const float4*)(W + wo + n);
+            uint ws4 = uint(ws) / 4u;
+            for (uint k = ks; k < K; k += 32) {
+                acc += X[xo + int(k) * xs] * W4[k * ws4];
+            }
+        } else {
+            for (uint k = ks; k < K; k += 32) {
+                float xv = X[xo + int(k) * xs];
+                for (uint j = 0; j < 4; ++j) {
+                    if (n + j < N) acc[j] += xv * W[wo + int(k) * ws + int(n + j)];
+                }
+            }
+        }
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (ks == 0 && n < N) {
+        float4 total = float4(0.0);
+        for (uint j = 0; j < 32; ++j) total += partial[c4 + 8 * j];
+        for (uint j = 0; j < 4; ++j) {
+            if (n + j < N) OUT[co + n + j] = total[j];
+        }
+    }
+}
+
+static inline long xaddr(
+    constant int* m, constant int* spec,
+    constant int* im0, constant int* im1, constant int* im2, constant int* im3,
+    device const int* I0, device const int* I1, device const int* I2, device const int* I3,
+    uint i)
+{
+    long off = strided_off(m, i);
+    int nind = spec[0];
+    for (int k = 0; k < nind; ++k) {
+        int b = spec[1 + 2 * k];
+        long st = spec[2 + 2 * k];
+        int v;
+        if (b == 0) v = I0[strided_off(im0, i)];
+        else if (b == 1) v = I1[strided_off(im1, i)];
+        else if (b == 2) v = I2[strided_off(im2, i)];
+        else v = I3[strided_off(im3, i)];
+        off += (long)v * st;
+    }
+    return off;
+}
+
+#define XCOPY_PARAMS \
+    device const int* I0 [[buffer(2)]], \
+    device const int* I1 [[buffer(3)]], \
+    device const int* I2 [[buffer(4)]], \
+    device const int* I3 [[buffer(5)]], \
+    constant uint& n     [[buffer(6)]], \
+    constant int* rmeta  [[buffer(7)]], \
+    constant int* wmeta  [[buffer(8)]], \
+    constant int* rspec  [[buffer(9)]], \
+    constant int* wspec  [[buffer(10)]], \
+    constant int* im0    [[buffer(11)]], \
+    constant int* im1    [[buffer(12)]], \
+    constant int* im2    [[buffer(13)]], \
+    constant int* im3    [[buffer(14)]], \
+    uint gid [[thread_position_in_grid]]
+
+kernel void xcopy_f(
+    device const float* SRC [[buffer(0)]],
+    device float*       DST [[buffer(1)]],
+    XCOPY_PARAMS)
+{
+    if (gid >= n) return;
+    long r = xaddr(rmeta, rspec, im0, im1, im2, im3, I0, I1, I2, I3, gid);
+    long w = xaddr(wmeta, wspec, im0, im1, im2, im3, I0, I1, I2, I3, gid);
+    DST[w] = SRC[r];
+}
+
+kernel void xcopy_i(
+    device const int* SRC [[buffer(0)]],
+    device int*       DST [[buffer(1)]],
+    XCOPY_PARAMS)
+{
+    if (gid >= n) return;
+    long r = xaddr(rmeta, rspec, im0, im1, im2, im3, I0, I1, I2, I3, gid);
+    long w = xaddr(wmeta, wspec, im0, im1, im2, im3, I0, I1, I2, I3, gid);
+    DST[w] = SRC[r];
+}
+
+kernel void xcopy_i2f(
+    device const int* SRC [[buffer(0)]],
+    device float*     DST [[buffer(1)]],
+    XCOPY_PARAMS)
+{
+    if (gid >= n) return;
+    long r = xaddr(rmeta, rspec, im0, im1, im2, im3, I0, I1, I2, I3, gid);
+    long w = xaddr(wmeta, wspec, im0, im1, im2, im3, I0, I1, I2, I3, gid);
+    DST[w] = float(SRC[r]);
+}
+
+kernel void lt_strided(
+    device const int*     A [[buffer(0)]],
+    device const int*     B [[buffer(1)]],
+    device unsigned char* C [[buffer(2)]],
+    constant uint&        n [[buffer(3)]],
+    constant int*        ma [[buffer(4)]],
+    constant int*        mb [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    C[gid] = A[strided_off(ma, gid)] < B[strided_off(mb, gid)] ? 1 : 0;
+}
+
+kernel void reduce_sum_l(
+    device const float* X    [[buffer(0)]],
+    device float*       OUT  [[buffer(1)]],
+    constant uint&      outer [[buffer(2)]],
+    constant uint&      axis  [[buffer(3)]],
+    constant uint&      inner [[buffer(4)]],
+    constant int*       m     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= outer * inner) return;
+    uint o = gid / inner;
+    uint in_ = gid % inner;
+    float s = 0.0;
+    for (uint a = 0; a < axis; ++a) {
+        s += X[strided_off(m, (o * axis + a) * inner + in_)];
+    }
+    OUT[gid] = s;
+}
+
+kernel void reduce_max_l(
+    device const float* X    [[buffer(0)]],
+    device float*       OUT  [[buffer(1)]],
+    constant uint&      outer [[buffer(2)]],
+    constant uint&      axis  [[buffer(3)]],
+    constant uint&      inner [[buffer(4)]],
+    constant int*       m     [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= outer * inner) return;
+    uint o = gid / inner;
+    uint in_ = gid % inner;
+    float v = -INFINITY;
+    for (uint a = 0; a < axis; ++a) {
+        v = max(v, X[strided_off(m, (o * axis + a) * inner + in_)]);
+    }
+    OUT[gid] = v;
+}
+
+kernel void ew_chain(
+    device const float* E0  [[buffer(0)]],
+    device const float* E1  [[buffer(1)]],
+    device const float* E2  [[buffer(2)]],
+    device const float* E3  [[buffer(3)]],
+    device float*       OUT [[buffer(4)]],
+    constant uint&      n   [[buffer(5)]],
+    constant int*       prog [[buffer(6)]],
+    constant int*       m0  [[buffer(7)]],
+    constant int*       m1  [[buffer(8)]],
+    constant int*       m2  [[buffer(9)]],
+    constant int*       m3  [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float v = E0[strided_off(m0, gid)];
+    int steps = prog[0];
+    for (int s = 0; s < steps; ++s) {
+        int op = prog[1 + 3 * s];
+        int kind = prog[2 + 3 * s];
+        int payload = prog[3 + 3 * s];
+        float a = 0.0;
+        if (kind == 1) {
+            a = as_type<float>(payload);
+        } else if (kind == 2) {
+            if (payload == 1) a = E1[strided_off(m1, gid)];
+            else if (payload == 2) a = E2[strided_off(m2, gid)];
+            else a = E3[strided_off(m3, gid)];
+        }
+        switch (op) {
+            case 0: v = v * a; break;
+            case 1: v = v + a; break;
+            case 2: v = 1.0f / v; break;
+            case 3: v = sqrt(v); break;
+            case 4: v = exp2(v); break;
+        }
+    }
+    OUT[gid] = v;
+}
+
+kernel void rmsnorm_row(
+    device const float* X   [[buffer(0)]],
+    device float*       OUT [[buffer(1)]],
+    constant uint&      rows [[buffer(2)]],
+    constant uint&      cols [[buffer(3)]],
+    constant float&     eps  [[buffer(4)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]])
+{
+    threadgroup float partial[256];
+    if (tgid >= rows) return;
+    device const float* x = X + tgid * cols;
+    float acc = 0.0;
+    for (uint j = tid; j < cols; j += 256) {
+        float v = x[j];
+        acc += v * v;
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float s = 0.0;
+        for (uint j = 0; j < 256; ++j) s += partial[j];
+        partial[0] = 1.0f / sqrt(s * (1.0f / float(cols)) + eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = partial[0];
+    device float* o = OUT + tgid * cols;
+    for (uint j = tid; j < cols; j += 256) {
+        o[j] = x[j] * r;
+    }
+}
+
+kernel void silu_mul(
+    device const float* G   [[buffer(0)]],
+    device const float* U   [[buffer(1)]],
+    device float*       OUT [[buffer(2)]],
+    constant uint&      n   [[buffer(3)]],
+    constant float&     kk  [[buffer(4)]],
+    constant float&     c3  [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= n) return;
+    float g = G[gid];
+    float sig = 1.0f / (exp2(g * kk) + c3);
+    OUT[gid] = g * sig * U[gid];
 }
 
 kernel void mul2(

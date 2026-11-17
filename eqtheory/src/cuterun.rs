@@ -31,8 +31,8 @@ fn run_config(name: &str, cfg: Option<ModelConfig>) {
     let cute_logits = ex.read_f32(loaded.outputs[0].id);
     println!("plan {plan_ms:.1} ms, execute {exec_ms:.3} ms/token -> {:.0} tok/s", 1000.0/exec_ms);
     println!(
-        "cute executor: {} dispatches ({} tiled matmuls), {} materializes, {} inline strided reads, {:.1} ms wall",
-        ex.dispatches.get(), ex.matmuls_paired.get(), ex.materializes.get(), ex.inline_reads.get(), cute_ms
+        "cute executor: {} dispatches ({} tiled matmuls), {} materializes, {} inline strided reads, {} fused chains, {} unclaimed ew edges, {} static idx folds, {:.1} ms wall",
+        ex.dispatches.get(), ex.matmuls_paired.get(), ex.materializes.get(), ex.inline_reads.get(), ex.fused_chains.get(), ex.generic_ew_edges.get(), ex.static_idx_folds.get(), cute_ms
     );
 
     let mut rt = MetalRuntime::load_with(
