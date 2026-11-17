@@ -12,34 +12,23 @@ name = "egraph"
 path = "src/egraph.rs"
 
 [[bin]]
-name = "compare"
-path = "src/compare.rs"
+name = "smoke"
+path = "src/smoke.rs"
+
+[[bin]]
+name = "pipeline"
+path = "src/pipeline.rs"
 
 [[bin]]
 name = "ab"
 path = "src/ab.rs"
 
-[[bin]]
-name = "sweep"
-path = "src/sweep.rs"
-
-[[bin]]
-name = "verify"
-path = "src/verify.rs"
-
-[[bin]]
-name = "backend"
-path = "src/backend.rs"
-
-[[bin]]
-name = "membound"
-path = "src/membound.rs"
-
 [dependencies]
 cute-layout = { path = "cute-layout" }
 egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
-luminal = { path = "../refs/luminal" }
+luminal = { path = "../refs/luminal", features = ["cute"] }
 luminal_metal = { path = "../refs/luminal/crates/luminal_metal" }
+model_zoo = { path = "../refs/luminal/crates/model_zoo" }
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
 anyhow = "1"

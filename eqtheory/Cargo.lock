@@ -600,6 +600,7 @@ dependencies = [
  "luminal",
  "luminal_metal",
  "metal",
+ "model_zoo",
  "objc",
 ]
 
@@ -885,6 +886,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1009,7 +1019,7 @@ dependencies = [
  "generational-box",
  "graphviz-rust",
  "half",
- "itertools",
+ "itertools 0.11.0",
  "lru",
  "luminal_snapshot",
  "num-traits",
@@ -1039,6 +1049,16 @@ dependencies = [
  "metal",
  "objc",
  "petgraph",
+ "rand 0.9.5",
+ "rustc-hash",
+]
+
+[[package]]
+name = "luminal_nn"
+version = "0.1.0"
+dependencies = [
+ "itertools 0.12.1",
+ "luminal",
  "rand 0.9.5",
  "rustc-hash",
 ]
@@ -1094,6 +1114,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
 dependencies = [
  "libmimalloc-sys",
+]
+
+[[package]]
+name = "model_zoo"
+version = "0.1.0"
+dependencies = [
+ "luminal",
+ "luminal_nn",
 ]
 
 [[package]]

@@ -82,8 +82,7 @@ pub fn allocate_arena(rt: &MetalRuntime) -> Result<Allocation> {
     Allocation::new(rt.metal_device()?, rt.metal_queue()?, rt.arena_bytes()?)
 }
 
-pub fn upload(rt: &MetalRuntime, arena: &mut Allocation, t: NodeIndex, data: Vec<f32>) -> Result<()> {
-    let hb: HostBuffer = data.into();
+pub fn upload(rt: &MetalRuntime, arena: &mut Allocation, t: NodeIndex, hb: HostBuffer) -> Result<()> {
     let home = rt.input_arena_range(t)?;
     ensure!(hb.bytes.len() == home.bytes, "input byte count mismatch");
     arena.write(home.offset, &hb.bytes)
