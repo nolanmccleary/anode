@@ -2,19 +2,22 @@ use eqtheory::loaders;
 use luminal::bufferize::BufferNode;
 use luminal::logical_ir::FusionMode;
 use luminal_metal::bindings::MetalBindings;
-use luminal_metal::{metal_registry, MetalRuntime};
+use luminal_metal::MetalRuntime;
 use std::collections::BTreeMap;
+
+const N: usize = 256;
+const DEPTH: usize = 8;
 
 fn plan_labels(fusion: FusionMode) -> BTreeMap<String, usize> {
     luminal::logical_ir::set_cute_lowering(true);
-    let loaded = loaders::load_default();
+    let loaded = loaders::load_deep_views(N, DEPTH);
     luminal::logical_ir::set_cute_lowering(false);
 
     let read = loaded.read_ids();
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read),
-        metal_registry(),
+        eqtheory::kernels::shared_registry(),
     )
     .expect("load");
 
@@ -36,7 +39,8 @@ fn plan_labels(fusion: FusionMode) -> BTreeMap<String, usize> {
 }
 
 fn main() {
-    println!("KERNEL-LIST DIFF: cute fusion vs Luminal fusion (both cute lowering, loaded MiniLlama3)\n");
+    println!("KERNEL-LIST DIFF: cute fusion vs Luminal fusion on a DEEP-VIEW model");
+    println!("(transpose+split+merge x{DEPTH}, N={N}, then matmul; both cute lowering)\n");
     let cute = plan_labels(FusionMode::Cute);
     let lum = plan_labels(FusionMode::Luminal);
 

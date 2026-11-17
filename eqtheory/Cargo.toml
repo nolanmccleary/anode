@@ -31,6 +31,18 @@ path = "src/fusion.rs"
 name = "kerneldiff"
 path = "src/kerneldiff.rs"
 
+[[bin]]
+name = "distribution"
+path = "src/distribution.rs"
+
+[[bin]]
+name = "rsqrtcheck"
+path = "src/rsqrtcheck.rs"
+
+[[bin]]
+name = "cutematch"
+path = "src/cutematch.rs"
+
 [dependencies]
 cute-layout = { path = "cute-layout" }
 egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
@@ -40,3 +52,47 @@ model_zoo = { path = "../refs/luminal/crates/model_zoo" }
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
 anyhow = "1"
+
+[[bin]]
+name = "cutesat"
+path = "src/cutesat.rs"
+
+[[bin]]
+name = "cuteextract"
+path = "src/cuteextract.rs"
+
+[[bin]]
+name = "cutelower"
+path = "src/cutelower.rs"
+
+[[bin]]
+name = "cuteviews"
+path = "src/cuteviews.rs"
+
+[[bin]]
+name = "cutecompose"
+path = "src/cutecompose.rs"
+
+[[bin]]
+name = "census"
+path = "src/census.rs"
+
+[[bin]]
+name = "kernelcheck"
+path = "src/kernelcheck.rs"
+
+[[bin]]
+name = "cuterun"
+path = "src/cuterun.rs"
+
+[[bin]]
+name = "affineplan"
+path = "src/affineplan.rs"
+
+[[bin]]
+name = "affinerun"
+path = "src/affinerun.rs"
+
+[[bin]]
+name = "cuteab"
+path = "src/cuteab.rs"

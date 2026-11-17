@@ -56,6 +56,39 @@ impl CuteMetal {
         self.queue.new_command_buffer()
     }
 
+    pub fn owned_command_buffer(&self) -> metal::CommandBuffer {
+        self.queue.new_command_buffer().to_owned()
+    }
+
+    pub fn pipeline(&self, name: &str) -> &ComputePipelineState {
+        self.pipe(name)
+    }
+
+    pub fn upload_i32(&self, data: &[i32]) -> Buffer {
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            (data.len() * 4).max(4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    pub fn upload_u8(&self, data: &[u8]) -> Buffer {
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const c_void,
+            data.len().max(4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    pub fn alloc_bytes(&self, bytes: usize) -> Buffer {
+        self.device
+            .new_buffer(bytes.max(4) as u64, MTLResourceOptions::StorageModeShared)
+    }
+
+    pub fn read_i32(&self, buf: &Buffer, n: usize) -> Vec<i32> {
+        unsafe { std::slice::from_raw_parts(buf.contents() as *const i32, n) }.to_vec()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_into(
         &self,

@@ -4,7 +4,7 @@ use luminal::bufferize::BufferNode;
 use luminal::dtype::DType;
 use luminal::logical_ir::FusionMode;
 use luminal_metal::bindings::MetalBindings;
-use luminal_metal::{metal_registry, MetalRuntime};
+use luminal_metal::MetalRuntime;
 use std::time::Instant;
 
 const M2_AIR_PEAK_GBPS: f64 = 100.0;
@@ -28,7 +28,7 @@ fn run(cute_lowering: bool, fusion: FusionMode) -> R {
     let mut rt = MetalRuntime::load_with(
         &loaded.graph,
         MetalBindings::dense(&loaded.graph.logical, &read),
-        metal_registry(),
+        eqtheory::kernels::shared_registry(),
     )
     .expect("load");
 

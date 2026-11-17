@@ -83,6 +83,24 @@ pub fn load_default() -> Loaded {
     load(&ModelConfig::default())
 }
 
+pub fn load_deep_views(n: usize, depth: usize) -> Loaded {
+    let dim = IntExpr::from;
+    let ni = n as i64;
+    let mut cx = Graph::new();
+    let x = cx.tensor([dim(ni), dim(ni)], DType::F32);
+    let mut t = x;
+    for _ in 0..depth {
+        t = t.transpose(0, 1).merge_dims(0, 1).split_dims(0, dim(ni));
+    }
+    let w = cx.tensor([dim(ni), dim(ni)], DType::F32);
+    let out: GraphTensor = t.matmul(w);
+    Loaded {
+        graph: cx,
+        outputs: vec![out],
+        fixed: Vec::new(),
+    }
+}
+
 fn test_f32(n: usize, seed: usize) -> Vec<f32> {
     (0..n)
         .map(|i| (((i * 37 + seed * 101 + 13) % 121) as f32 / 100.0) - 0.6)

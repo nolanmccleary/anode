@@ -1,4 +1,9 @@
+pub mod affine_arm;
 pub mod arena;
+pub mod cute_egraph;
+pub mod cute_match;
+pub mod cute_probe;
+pub mod executor;
 pub mod kernels;
 pub mod loaders;
 pub mod metal_backend;
