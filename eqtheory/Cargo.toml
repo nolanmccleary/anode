@@ -23,11 +23,19 @@ path = "src/pipeline.rs"
 name = "ab"
 path = "src/ab.rs"
 
+[[bin]]
+name = "fusion"
+path = "src/fusion.rs"
+
+[[bin]]
+name = "kerneldiff"
+path = "src/kerneldiff.rs"
+
 [dependencies]
 cute-layout = { path = "cute-layout" }
 egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
 luminal = { path = "../refs/luminal", features = ["cute"] }
-luminal_metal = { path = "../refs/luminal/crates/luminal_metal" }
+luminal_metal = { path = "../refs/luminal/crates/luminal_metal", features = ["cute"] }
 model_zoo = { path = "../refs/luminal/crates/model_zoo" }
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"

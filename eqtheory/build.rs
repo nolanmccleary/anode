@@ -86,6 +86,12 @@ fn main() {
         "refs/luminal/Cargo.toml",
         "refs/luminal/src/frontend/movement.rs",
         "refs/luminal/src/logical/ir.rs",
+        "refs/luminal/src/extraction.rs",
+        "refs/luminal/crates/luminal_metal/Cargo.toml",
+        "refs/luminal/crates/luminal_metal/src/bindings.rs",
+        "refs/luminal/crates/luminal_metal/src/saturation.rs",
+        "refs/luminal/src/logical/op/index_map_apply/compose.egg",
+        "refs/luminal/src/logical/op/index_map_apply/mod.rs",
     ];
     if let Ok(out) = Command::new("git")
         .args(["status", "--porcelain", "--", "refs/luminal"])
