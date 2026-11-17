@@ -27,6 +27,14 @@ path = "src/sweep.rs"
 name = "verify"
 path = "src/verify.rs"
 
+[[bin]]
+name = "backend"
+path = "src/backend.rs"
+
+[[bin]]
+name = "membound"
+path = "src/membound.rs"
+
 [dependencies]
 cute-layout = { path = "cute-layout" }
 egglog = { git = "https://github.com/luminal-ai/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
