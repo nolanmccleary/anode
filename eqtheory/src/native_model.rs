@@ -22,6 +22,7 @@ pub struct NativeModel {
     pub scatter_idx: Tensor,
     pub cache_ins: Vec<(Tensor, Tensor)>,
     pub mask: Tensor,
+    pub probes: Vec<(String, usize)>,
 }
 
 const LOG2E: f32 = std::f32::consts::LOG2_E;
@@ -82,6 +83,7 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
 
     let mut x = g.gather_rows(embed, ids, s);
     let mut cache_outs = Vec::new();
+    let mut probes: Vec<(String, usize)> = Vec::new();
 
     for l in 0..cfg.layers as usize {
         let p = format!("model.layers.{l}");
@@ -97,17 +99,20 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         let q = g.matmul(normed, wq);
         let k = g.matmul(normed, wk);
         let v = g.matmul(normed, wv);
+        probes.push((format!("q.{l}"), q.id));
 
         let (kc_in, vc_in) = cache_ins[l];
         let kc = g.scatter_rows(kc_in, scatter_idx, k);
         let vc = g.scatter_rows(vc_in, scatter_idx, v);
         let keys = g.gather_rows(kc, gather_idx, ctx);
         let vals = g.gather_rows(vc, gather_idx, ctx);
+        probes.push((format!("keys.{l}"), keys.id));
 
         let sh = vec![kv, grp, s, ctx, hd];
         let qr = Read { src: q.id, layout: layout_of(&sh, &[grp * hd, hd, d, 0, 1]) };
         let kr = Read { src: keys.id, layout: layout_of(&sh, &[hd, 0, 0, kvd, 1]) };
         let scores_raw = g.movn(vec![kv, grp, s, ctx], qr, Some(kr), hd, true);
+        probes.push((format!("scores.{l}"), scores_raw.id));
         let scores = g.scale(scores_raw, scale);
 
         let msh = vec![kv, grp, s, ctx, 2];
@@ -132,6 +137,7 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         };
         let vr = Read { src: vals.id, layout: layout_of(&psh, &[hd, 0, 0, 1, kvd]) };
         let attn_h = g.movn(vec![kv, grp, s, hd], pr, Some(vr), ctx, true);
+        probes.push((format!("attn_h.{l}"), attn_h.id));
 
         let flat = vec![s, d];
         let attn = if s == 1 {
@@ -149,6 +155,7 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
 
         let o = g.matmul(attn, wo);
         x = g.add(x, o);
+        probes.push((format!("resid_attn.{l}"), x.id));
 
         let ffin = rms_norm(&mut g, x, d, eps);
         let gate = g.matmul(ffin, wgate);
@@ -157,6 +164,7 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         let h = g.mul(act, up);
         let down = g.matmul(h, wdown);
         x = g.add(x, down);
+        probes.push((format!("resid_ff.{l}"), x.id));
 
         cache_outs.push((kc, vc));
     }
@@ -176,5 +184,6 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         scatter_idx,
         cache_ins,
         mask: mask_t,
+        probes,
     }
 }

@@ -773,7 +773,57 @@ impl<'g> Exec<'g> {
         }
     }
 
+    // When an operand's strides cannot group to one (row, col) stride pair, the
+    // matmul can instead read a row-major copy of the operand's true elements:
+    // broadcast (stride-0) axes squeeze to extent 1, so the copy holds m*k (or
+    // k*n) elements, never the full broadcast product. Batched plans keep
+    // original-layout batch strides, so a copy would invalidate them — refuse.
+    fn squeeze_plan(&self, l: &Layout, dims: &[i64], rank: usize, batched: bool) -> Option<(Layout, Vec<i64>)> {
+        if batched {
+            return None;
+        }
+        let sq: Vec<i64> = (0..rank)
+            .map(|ax| if axis_modes(l, ax, rank).iter().any(|(_, d)| *d != 0) { dims[ax] } else { 1 })
+            .collect();
+        Some((identity_layout(&sq), sq))
+    }
+
+    // Dispatch-time companion of squeeze_plan: copy the operand's varying axes
+    // (coordinates on squeezed axes pinned at 0) into a dense row-major buffer.
+    fn squeezed_copy(&mut self, src: NodeIndex, sq_dims: &[i64]) -> Buffer {
+        let (base, acc) = self.resolve(src);
+        let (mut ss, mut dd) = (Vec::new(), Vec::new());
+        for (ax, sq) in sq_dims.iter().enumerate() {
+            if *sq == 1 {
+                ss.push(IntTuple::Leaf(1));
+                dd.push(IntTuple::Leaf(0));
+            } else {
+                let m = acc.get(ax);
+                let mut flat = Vec::new();
+                flat_pairs(&m.shape, &m.stride, &mut flat);
+                let extent: i64 = flat.iter().map(|(s, _)| s).product();
+                assert_eq!(extent, *sq, "squeezed copy axis extent");
+                ss.push(m.shape.clone());
+                dd.push(m.stride.clone());
+            }
+        }
+        let sq_acc = Layout::new(IntTuple::Tuple(ss), IntTuple::Tuple(dd));
+        let n = numel(sq_dims);
+        let meta = meta_of(&sq_acc, sq_dims.len()).expect("squeezed copy meta");
+        let out = self.alloc(n as usize * 4);
+        let srcb = self.vals[&base].buf.clone();
+        self.run_xcopy("xcopy_f", &srcb, &out, &[], n, meta, flat_meta(n), [0; 8], [0; 8]);
+        self.materializes.set(self.materializes.get() + 1);
+        out
+    }
+
     fn plan_matmuls(&mut self) {
+        let dbg = std::env::var("MMDEBUG").is_ok();
+        let rej = |rs: NodeIndex, mul: NodeIndex, numel: i64, why: &str| {
+            if dbg {
+                eprintln!("MMDEBUG reject rs={} mul={} numel={numel}: {why}", rs.index(), mul.index());
+            }
+        };
         let ids: Vec<NodeIndex> = self.g.node_indices().collect();
         for rs in ids {
             let LogicalOp::ReduceSum { axis_from_end } = self.g[rs].op else {
@@ -786,23 +836,29 @@ impl<'g> Exec<'g> {
             if !matches!(self.g[mul].op, LogicalOp::Mul) {
                 continue;
             }
-            if self.g.neighbors_directed(mul, Direction::Outgoing).count() != 1 {
-                continue;
-            }
+            let nconsumers = self.g.neighbors_directed(mul, Direction::Outgoing).count();
             let ops = self.operands(mul);
             let dims = self.dims(mul);
+            let numel: i64 = dims.iter().product();
+            if nconsumers != 1 {
+                rej(rs, mul, numel, &format!("mul has {nconsumers} consumers"));
+                continue;
+            }
             let rank = dims.len();
             let ax = rank - 1 - axis_from_end;
             let Some((a_base, al)) = self.resolve_dry(ops[0]) else {
+                rej(rs, mul, numel, "operand a not dry-resolvable");
                 continue;
             };
             let Some((b_base, bl)) = self.resolve_dry(ops[1]) else {
+                rej(rs, mul, numel, "operand b not dry-resolvable");
                 continue;
             };
             let varies = |l: &Layout, axis: usize| {
                 axis_modes(l, axis, rank).iter().any(|(_, d)| *d != 0)
             };
             if !varies(&al, ax) || !varies(&bl, ax) {
+                rej(rs, mul, numel, "operand constant along contraction axis");
                 continue;
             }
             let (mut m_axes, mut n_axes, mut b_axes) = (Vec::new(), Vec::new(), Vec::new());
@@ -825,6 +881,7 @@ impl<'g> Exec<'g> {
                 ok = false;
             }
             if !ok || m_axes.iter().any(|ma| n_axes.iter().any(|na| ma > na)) {
+                rej(rs, mul, numel, &format!("axis classification m={m_axes:?} n={n_axes:?} b={b_axes:?}"));
                 continue;
             }
             let out_dims_full = self.dims(rs);
@@ -833,6 +890,7 @@ impl<'g> Exec<'g> {
                 let mn_min = m_axes.iter().chain(n_axes.iter()).min().copied();
                 if let Some(mn) = mn_min {
                     if innermost_b > mn {
+                        rej(rs, mul, numel, "batch axis inside m/n axes");
                         continue;
                     }
                 }
@@ -866,6 +924,7 @@ impl<'g> Exec<'g> {
                 nbatch *= dims[*axis];
             }
             if !bfit {
+                rej(rs, mul, numel, "batch strides not groupable or exceed i32");
                 continue;
             }
             let collect = |l: &Layout, axes: &[usize]| -> Vec<(i64, i64)> {
@@ -875,23 +934,58 @@ impl<'g> Exec<'g> {
                 }
                 v
             };
-            let Some(ars) = group_stride(collect(&al, &m_axes)) else {
-                continue;
-            };
-            let Some(acs) = group_stride(collect(&al, &[ax])) else {
-                continue;
-            };
-            let Some(brs) = group_stride(collect(&bl, &[ax])) else {
-                continue;
-            };
-            let Some(bcs) = group_stride(collect(&bl, &n_axes)) else {
-                continue;
-            };
             let m: i64 = m_axes.iter().map(|x| dims[*x]).product();
             let n: i64 = n_axes.iter().map(|x| dims[*x]).product();
             let k = dims[ax];
+            // When an operand's strides cannot group to one (row, col) stride pair,
+            // plan against a contiguous copy of the operand (value-identical, copied
+            // at dispatch via contiguous_val) instead of leaving the node to the
+            // naive path, which materializes the full m*k*n broadcast product.
+            let (al, a_fix) = match (
+                group_stride(collect(&al, &m_axes)),
+                group_stride(collect(&al, &[ax])),
+            ) {
+                (Some(_), Some(_)) => (al, None),
+                _ => match self.squeeze_plan(&al, &dims, rank, !b_axes.is_empty()) {
+                    Some((l, sq)) => (l, Some((ops[0], sq))),
+                    None => {
+                        rej(rs, mul, numel, "a strides not groupable, batched copy not plannable");
+                        continue;
+                    }
+                },
+            };
+            let (bl, b_fix) = match (
+                group_stride(collect(&bl, &[ax])),
+                group_stride(collect(&bl, &n_axes)),
+            ) {
+                (Some(_), Some(_)) => (bl, None),
+                _ => match self.squeeze_plan(&bl, &dims, rank, !b_axes.is_empty()) {
+                    Some((l, sq)) => (l, Some((ops[1], sq))),
+                    None => {
+                        rej(rs, mul, numel, "b strides not groupable, batched copy not plannable");
+                        continue;
+                    }
+                },
+            };
+            let Some(ars) = group_stride(collect(&al, &m_axes)) else {
+                rej(rs, mul, numel, "a row strides not groupable");
+                continue;
+            };
+            let Some(acs) = group_stride(collect(&al, &[ax])) else {
+                rej(rs, mul, numel, "a contraction strides not groupable");
+                continue;
+            };
+            let Some(brs) = group_stride(collect(&bl, &[ax])) else {
+                rej(rs, mul, numel, "b contraction strides not groupable");
+                continue;
+            };
+            let Some(bcs) = group_stride(collect(&bl, &n_axes)) else {
+                rej(rs, mul, numel, "b col strides not groupable");
+                continue;
+            };
             let fits = |v: i64| i32::try_from(v).is_ok();
             if ![ars, acs, brs, bcs, m, n, k].iter().all(|v| fits(*v)) {
+                rej(rs, mul, numel, "strides or extents exceed i32");
                 continue;
             }
             self.mm_skip.insert(mul);
@@ -900,6 +994,8 @@ impl<'g> Exec<'g> {
                 MatmulPlan {
                     a_base,
                     b_base,
+                    a_fix,
+                    b_fix,
                     m,
                     k,
                     n,
@@ -1081,6 +1177,12 @@ impl<'g> Exec<'g> {
     }
 
     fn run1d(&self, kernel: &'static str, bufs: &[&Buffer], args: &[(u64, Arg)], n: u64) {
+        const MAX_DISPATCH: u64 = 1 << 27;
+        assert!(
+            n <= MAX_DISPATCH,
+            "dispatch of {kernel} with n={n} exceeds {MAX_DISPATCH} threads — a planner \
+             miss is materializing a giant intermediate; refusing to pin that much memory"
+        );
         self.tape.borrow_mut().push(Tape::Run1d {
             kernel,
             bufs: bufs.iter().map(|b| (*b).clone()).collect(),
@@ -1136,8 +1238,44 @@ impl<'g> Exec<'g> {
         if std::env::var("ONEENC").is_ok() {
             return self.replay_one_encoder();
         }
+        if std::env::var("TAPETIME").is_ok() {
+            return self.replay_tape_timed();
+        }
         let cb = self.backend.owned_command_buffer();
         for t in self.tape.borrow().iter() {
+            self.encode_tape_entry(&cb, t);
+        }
+        cb.commit();
+        cb.wait_until_completed();
+    }
+
+    fn replay_tape_timed(&self) {
+        let mut totals: std::collections::HashMap<String, (f64, usize)> = Default::default();
+        for t in self.tape.borrow().iter() {
+            let cb = self.backend.owned_command_buffer();
+            let t0 = std::time::Instant::now();
+            self.encode_tape_entry(&cb, t);
+            cb.commit();
+            cb.wait_until_completed();
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let label = match t {
+                Tape::Run1d { kernel, n, .. } => format!("{kernel} n={n}"),
+                Tape::MetaOnly { kernel, n, .. } => format!("{kernel} n={n}"),
+                Tape::Matmul { m, k, n, nbatch, .. } => format!("matmul {m}x{k}x{n} b={nbatch}"),
+            };
+            let e = totals.entry(label).or_insert((0.0, 0));
+            e.0 += ms;
+            e.1 += 1;
+        }
+        let mut v: Vec<_> = totals.into_iter().collect();
+        v.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+        for (label, (ms, count)) in v.iter().take(20) {
+            eprintln!("TAPETIME {ms:>10.1}ms x{count:<5} {label}");
+        }
+    }
+
+    fn encode_tape_entry(&self, cb: &metal::CommandBufferRef, t: &Tape) {
+        {
             match t {
                 Tape::Run1d { kernel, bufs, args, n } => {
                     let enc = cb.new_compute_command_encoder();
@@ -1177,15 +1315,13 @@ impl<'g> Exec<'g> {
                 }
                 Tape::Matmul { a, b, c, m, k, n, ap, bp, cp, batch, nbatch } => {
                     if *nbatch > 1 {
-                        self.backend.bmm_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
+                        self.backend.bmm_into(cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
                     } else {
-                        self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                        self.backend.matmul_or_gemv_into(cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
                     }
                 }
             }
         }
-        cb.commit();
-        cb.wait_until_completed();
     }
 
     fn operand_meta(&mut self, id: NodeIndex) -> (NodeIndex, [i32; 18]) {
@@ -1334,6 +1470,9 @@ impl<'g> Exec<'g> {
             self.plan_fusions();
         }
         self.plan_matmuls();
+        if std::env::var("PLANONLY").is_ok() {
+            return;
+        }
         let order = toposort(&self.g, None).expect("logical graph is a DAG");
         for id in order {
             if self.mm_skip.contains(&id) || self.fuse_skip.contains(&id) {
@@ -1347,6 +1486,14 @@ impl<'g> Exec<'g> {
                 let dims = self.dims(id);
                 let n_out = numel(&dims);
                 assert_eq!(n_out, plan.m * plan.n * plan.nbatch, "matmul out extents");
+                let a_buf = match &plan.a_fix {
+                    Some((src, sq)) => self.squeezed_copy(*src, sq),
+                    None => self.vals[&plan.a_base].buf.clone(),
+                };
+                let b_buf = match &plan.b_fix {
+                    Some((src, sq)) => self.squeezed_copy(*src, sq),
+                    None => self.vals[&plan.b_base].buf.clone(),
+                };
                 let out = self.alloc(n_out as usize * 4);
                 if plan.nbatch == 1
                     && plan.m == 1
@@ -1356,15 +1503,15 @@ impl<'g> Exec<'g> {
                     self.backend.tune_gemv(
                         plan.k as usize,
                         plan.n as usize,
-                        &self.vals[&plan.a_base].buf,
-                        &self.vals[&plan.b_base].buf,
+                        &a_buf,
+                        &b_buf,
                         plan.ap,
                         plan.bp,
                     );
                 }
                 self.tape.borrow_mut().push(Tape::Matmul {
-                    a: self.vals[&plan.a_base].buf.clone(),
-                    b: self.vals[&plan.b_base].buf.clone(),
+                    a: a_buf,
+                    b: b_buf,
                     c: out.clone(),
                     m: plan.m as usize,
                     k: plan.k as usize,
@@ -1803,6 +1950,8 @@ enum Fused {
 struct MatmulPlan {
     a_base: NodeIndex,
     b_base: NodeIndex,
+    a_fix: Option<(NodeIndex, Vec<i64>)>,
+    b_fix: Option<(NodeIndex, Vec<i64>)>,
     m: i64,
     k: i64,
     n: i64,

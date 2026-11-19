@@ -1,1 +1,0 @@
-Map<std::slice::Iter<'_, HTuple>, for<'a, 'b> fn(&'a HTuple, &'b HTuple) -> bool {HTuple::is_congruent}>

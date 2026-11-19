@@ -1,0 +1,11 @@
+[package]
+name = "burnrun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "0.22", features = ["metal", "fusion", "autotune"] }
+
+[[bin]]
+name = "run_burn"
+path = "src/main.rs"

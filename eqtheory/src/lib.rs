@@ -1,10 +1,14 @@
 pub mod atoms;
+pub mod cpu_ref;
 pub mod cute_egraph;
 pub mod cute_match;
 pub mod ir;
 pub mod kernels;
 pub mod metal_backend;
 pub mod native_exec;
+pub mod onnx_proto;
+pub mod onnx_import;
+pub mod session_run;
 pub mod native_fuse;
 pub mod native_model;
 pub mod views;

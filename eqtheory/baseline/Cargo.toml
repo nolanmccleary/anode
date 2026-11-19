@@ -81,3 +81,7 @@ model_zoo = { path = "../../refs/luminal/crates/model_zoo" }
 metal = { version = "0.31", features = ["mps"] }
 anyhow = "1"
 objc = "0.2"
+
+[[bin]]
+name = "run_luminal"
+path = "src/run_luminal.rs"

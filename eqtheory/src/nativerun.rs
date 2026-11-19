@@ -51,6 +51,40 @@ fn main() {
     let model = build(&cfg, vec![0, 1]);
     println!("native graph: {} nodes", model.g.nodes.len());
 
+    if std::env::var("CPU_REF").is_ok() {
+        let t0 = Instant::now();
+        let vals = eqtheory::cpu_ref::eval(&model.g, &inputs);
+        println!("cpu ref: evaluated in {:.1} ms", t0.elapsed().as_secs_f64() * 1e3);
+        let mut order: Vec<usize> = vec![model.logits.id];
+        for (kc, vc) in &model.cache_outs {
+            order.push(kc.id);
+            order.push(vc.id);
+        }
+        let mut all_ok = true;
+        for (k, (id, want)) in order.iter().zip(outputs.iter()).enumerate() {
+            let got = vals.f[*id].as_ref().expect("cpu value");
+            let mut mx = 0f32;
+            let mut peak = 0f32;
+            for (a, b) in got.iter().zip(want.iter()) {
+                mx = mx.max((a - b).abs());
+                peak = peak.max(b.abs());
+            }
+            let ok = mx <= 1e-3 * peak.max(1.0);
+            all_ok &= ok;
+            if k == 0 || !ok {
+                println!(
+                    "cpu output {k}: max abs diff {mx:.3e} (peak {peak:.2e}) -> {}",
+                    if ok { "MATCH" } else { "MISMATCH" }
+                );
+            }
+        }
+        println!(
+            "cpu ref vs exported oracle: {}",
+            if all_ok { "ALL MATCH" } else { "MISMATCH" }
+        );
+        return;
+    }
+
     let t0 = Instant::now();
     let mut ex = NativeExec::new();
     ex.build(&model.g, &inputs);

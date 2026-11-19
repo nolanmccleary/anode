@@ -21,6 +21,8 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=proto/onnx.proto");
+    prost_build::compile_protos(&["proto/onnx.proto"], &["proto"]).expect("compile onnx.proto");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=tests");
     let mut files = Vec::new();
@@ -50,7 +52,7 @@ fn main() {
     ];
 
     let kernels_allow = ["kernels.rs", "metal_backend.rs"];
-    let loader_allow = ["native_model.rs"];
+    let loader_allow = ["native_model.rs", "onnx_import.rs"];
 
     let allowed_pointwise = ["Exp2", "Recip", "Sqrt", "Rsqrt", "Relu", "Step", "CastIdentity"];
     let ksrc = fs::read_to_string("src/kernels.rs").unwrap_or_default();
@@ -101,7 +103,7 @@ fn main() {
         }
     }
 
-    let fused_allowlist = ["softmax_rows", "rmsnorm_row", "attn_decode", "attn_online"];
+    let fused_allowlist = ["softmax_rows", "rmsnorm_row", "attn_decode", "attn_online", "attn_flash"];
     let kernels_src = fs::read_to_string("src/kernels.rs").unwrap_or_default();
     let kdef = ["kernel", "void "].join(" ");
     for block in kernels_src.split(&kdef).skip(1) {

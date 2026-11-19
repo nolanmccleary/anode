@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "baseline"]
+members = [".", "baseline", "ffi", "burnrun"]
 
 [package]
 name = "eqtheory"
@@ -12,6 +12,10 @@ egglog = { git = "https://github.com/egraphs-good/egglog", rev = "3787810fa259ef
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
 anyhow = "1"
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
 
 [[bin]]
 name = "compression"
@@ -48,3 +52,23 @@ path = "src/nativerun.rs"
 [[bin]]
 name = "session"
 path = "src/session.rs"
+
+[[bin]]
+name = "onnxdump"
+path = "src/onnxdump.rs"
+
+[[bin]]
+name = "onnxcheck"
+path = "src/onnxcheck.rs"
+
+[[bin]]
+name = "onnxsession"
+path = "src/onnxsession.rs"
+
+[[bin]]
+name = "cutedriver"
+path = "src/cutedriver.rs"
+
+[[bin]]
+name = "decodediff"
+path = "src/decodediff.rs"

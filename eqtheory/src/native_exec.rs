@@ -79,6 +79,102 @@ enum Tape {
     },
 }
 
+fn unclaim_attn_head(
+    g: &GraphIr,
+    users: &[Vec<usize>],
+    fusions: &mut native_fuse::Fusions,
+    id: usize,
+    sc: usize,
+) {
+    let scaled = users[sc][0];
+    let biased = users[scaled][0];
+    let l2 = users[biased][0];
+    let ex = users[l2][0];
+    let den = *users[ex]
+        .iter()
+        .find(|u| matches!(&g.nodes[**u].kind, NodeKind::Move { b: None, kext, .. } if *kext > 1))
+        .expect("attn den");
+    let rd = users[den][0];
+    let probs = *users[ex].iter().find(|u| **u != den).expect("attn probs");
+    for nid in [sc, scaled, biased, l2, ex, den, rd, probs] {
+        fusions.claims.remove(&nid);
+    }
+    fusions.attn.remove(&id);
+}
+
+pub struct ContractShape {
+    pub m: usize,
+    pub n: usize,
+    pub ap: [i32; 4],
+    pub bp: [i32; 4],
+    pub cp: [i32; 4],
+    pub batch: Vec<i32>,
+    pub nbatch: i64,
+}
+
+pub fn classify_contract(a: &Read, b: &Read, kext: i64, dims: &[i64]) -> ContractShape {
+    let (sha, sta) = axes_of(&a.layout);
+    let (_shb, stb) = axes_of(&b.layout);
+    let rank = sha.len();
+    let kax = rank - 1;
+    assert_eq!(sha[kax], kext, "k axis extent");
+    let mut a_only: Vec<usize> = Vec::new();
+    let mut b_only: Vec<usize> = Vec::new();
+    let mut b_axes: Vec<usize> = Vec::new();
+    for ax in 0..kax {
+        if dims[ax] == 1 {
+            continue;
+        }
+        match (sta[ax] != 0, stb[ax] != 0) {
+            (true, false) => a_only.push(ax),
+            (false, true) => b_only.push(ax),
+            _ => b_axes.push(ax),
+        }
+    }
+    let m_ax = a_only.pop();
+    let n_ax = b_only.pop();
+    b_axes.extend(a_only);
+    b_axes.extend(b_only);
+    b_axes.sort_unstable();
+    let after = |ax: usize| -> i64 { dims[ax + 1..].iter().product() };
+    let (m, am_s, cm_s) = match m_ax {
+        Some(ax) => (dims[ax], sta[ax], after(ax)),
+        None => (1, 0, 0),
+    };
+    let (nn, bn_s, cn_s) = match n_ax {
+        Some(ax) => (dims[ax], stb[ax], after(ax)),
+        None => (1, 0, 0),
+    };
+    let mut batch = vec![b_axes.len() as i32];
+    let mut nbatch = 1i64;
+    for ax in &b_axes {
+        batch.extend([
+            dims[*ax] as i32,
+            sta[*ax] as i32,
+            stb[*ax] as i32,
+            after(*ax) as i32,
+        ]);
+        nbatch *= dims[*ax];
+    }
+    if let (Some(ma), Some(na)) = (m_ax, n_ax) {
+        if let Some(maxb) = b_axes.iter().max() {
+            assert!(*maxb < ma.min(na), "batch axes must be outermost");
+        }
+    }
+    assert_eq!(numel(dims), m * nn * nbatch, "contract extents");
+    let crs = if m_ax.is_some() { cm_s } else { 1 };
+    let ccs = if n_ax.is_some() { cn_s } else { 1 };
+    ContractShape {
+        m: m as usize,
+        n: nn as usize,
+        ap: [0, am_s as i32, sta[kax] as i32, 0],
+        bp: [0, stb[kax] as i32, bn_s as i32, 0],
+        cp: [0, crs as i32, ccs as i32, 0],
+        batch,
+        nbatch,
+    }
+}
+
 fn pure_copy_read(g: &GraphIr, id: usize) -> Option<&Read> {
     if let NodeKind::Move { a, b: None, kext: 1, a_idx, write_idx, .. } = &g.nodes[id].kind {
         if a_idx.is_empty() && write_idx.is_empty() && g.nodes[id].dtype == g.nodes[a.src].dtype {
@@ -159,6 +255,8 @@ pub struct NativeExec {
     input_ids: std::collections::HashSet<usize>,
     hazard: std::collections::HashSet<usize>,
     pending: std::collections::HashMap<usize, (Read, i64)>,
+    force_no_attn: bool,
+    race_ambiguous: bool,
 }
 
 impl NativeExec {
@@ -174,6 +272,8 @@ impl NativeExec {
             input_ids: Default::default(),
             hazard: Default::default(),
             pending: Default::default(),
+            force_no_attn: false,
+            race_ambiguous: false,
         }
     }
 
@@ -186,10 +286,23 @@ impl NativeExec {
         self.buf(id)
     }
 
+    fn guard_write_overlap(&self, node: usize, write: &Buffer, reads: &[&Buffer]) {
+        let wp = write.contents() as usize;
+        let wl = write.length() as usize;
+        for r in reads {
+            let rp = r.contents() as usize;
+            let rl = r.length() as usize;
+            if wp < rp + rl && rp < wp + wl {
+                panic!("node {node}: move writes into memory it reads (write {wp:#x}+{wl}, read {rp:#x}+{rl})");
+            }
+        }
+    }
+
     fn emit_plain_copy(&mut self, id: usize, a: &Read, n: i64) {
         let meta = meta_of(&a.layout).expect("copy meta");
         let out = self.alloc(n as usize * 4);
         let sb = self.use_buf(a.src);
+        self.guard_write_overlap(id, &out, &[&sb]);
         self.xcopy(sb, out.clone(), vec![], n, meta, flat_meta(n), [0; 8], [0; 8]);
         self.bufs[id] = Some(out);
     }
@@ -267,8 +380,55 @@ impl NativeExec {
     }
 
     pub fn build(&mut self, g: &GraphIr, inputs: &std::collections::HashMap<String, Vec<f32>>) {
+        self.race_ambiguous = false;
+        self.force_no_attn = false;
+        self.build_inner(g, inputs);
+        if self.race_ambiguous && !self.inplace_cache && std::env::var("GENERAL_ONLY").is_err() {
+            let t_fused = self.time_replay();
+            let tape = std::mem::take(&mut self.tape);
+            let bufs = std::mem::take(&mut self.bufs);
+            let pending = std::mem::take(&mut self.pending);
+            let input_ids = std::mem::take(&mut self.input_ids);
+            let (disp, alloc, elided) = (self.dispatches, self.alloc_total, self.elided);
+            self.force_no_attn = true;
+            self.build_inner(g, inputs);
+            self.force_no_attn = false;
+            let t_dec = self.time_replay();
+            if std::env::var("ATTNTUNE").is_ok() {
+                eprintln!("attn whole-graph race: fused {t_fused:.3} ms vs decomposed {t_dec:.3} ms");
+            }
+            if t_fused <= t_dec {
+                self.tape = tape;
+                self.bufs = bufs;
+                self.pending = pending;
+                self.input_ids = input_ids;
+                self.dispatches = disp;
+                self.alloc_total = alloc;
+                self.elided = elided;
+            }
+        }
+    }
+
+    fn time_replay(&self) -> f64 {
+        self.replay();
+        let mut best = f64::INFINITY;
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            self.replay();
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    }
+
+    fn build_inner(&mut self, g: &GraphIr, inputs: &std::collections::HashMap<String, Vec<f32>>) {
         self.bufs = vec![None; g.nodes.len()];
-        let fusions = if std::env::var("GENERAL_ONLY").is_ok() {
+        self.tape.clear();
+        self.pending.clear();
+        self.input_ids.clear();
+        self.dispatches = 0;
+        self.alloc_total = 0;
+        self.elided = 0;
+        let mut fusions = if std::env::var("GENERAL_ONLY").is_ok() {
             native_fuse::Fusions {
                 claims: Default::default(),
                 rms: Default::default(),
@@ -313,6 +473,48 @@ impl NativeExec {
                 _ => panic!("expected scalar literal"),
             }
         };
+        if !fusions.attn.is_empty() {
+            let mut users: Vec<Vec<usize>> = vec![Vec::new(); g.nodes.len()];
+            for (i, node) in g.nodes.iter().enumerate() {
+                match &node.kind {
+                    NodeKind::Move { a, b, .. } => {
+                        users[a.src].push(i);
+                        if let Some(b) = b {
+                            users[b.src].push(i);
+                        }
+                    }
+                    NodeKind::Pointwise { read, .. } => users[read.src].push(i),
+                    _ => {}
+                }
+            }
+            let heads: Vec<(usize, (usize, usize, usize, usize, usize, usize))> =
+                fusions.attn.iter().map(|(k, v)| (*k, *v)).collect();
+            for (id, (_q, _kc, _v, mask, cs, sc)) in heads {
+                if self.force_no_attn {
+                    unclaim_attn_head(g, &users, &mut fusions, id, sc);
+                    continue;
+                }
+                let (p, vec_ok, _, _, _) = self.attn_setup(g, id, mask, litf(cs), sc);
+                let (_, _, _, fused_ms) = self.backend.tune_attn(&p, vec_ok);
+                let NodeKind::Move { a: sa, b: Some(sb), kext: sk, .. } = &g.nodes[sc].kind else {
+                    continue;
+                };
+                let NodeKind::Move { a: pa, b: Some(pb), kext: pk, .. } = &g.nodes[id].kind else {
+                    continue;
+                };
+                let sar = resolve_read(g, &self.hazard, sa);
+                let sbr = resolve_read(g, &self.hazard, sb);
+                let par = resolve_read(g, &self.hazard, pa);
+                let pbr = resolve_read(g, &self.hazard, pb);
+                let cls = classify_contract(&sar, &sbr, *sk, &g.nodes[sc].dims);
+                let clp = classify_contract(&par, &pbr, *pk, &g.nodes[id].dims);
+                let s_ms = self.backend.tune_gemm(cls.m, *sk as usize, cls.n, cls.ap, cls.bp, cls.cp, &cls.batch, cls.nbatch);
+                let p_ms = self.backend.tune_gemm(clp.m, *pk as usize, clp.n, clp.ap, clp.bp, clp.cp, &clp.batch, clp.nbatch);
+                if s_ms + p_ms < fused_ms {
+                    self.race_ambiguous = true;
+                }
+            }
+        }
         for (id, node) in g.nodes.iter().enumerate() {
             if fusions.claims.contains(&id) {
                 continue;
@@ -323,6 +525,7 @@ impl NativeExec {
                 let rows = numel(&xd) / cols;
                 let out = self.alloc(numel(&xd) as usize * 4);
                 let xb = self.use_buf(*x);
+                self.guard_write_overlap(id, &out, &[&xb]);
                 self.push1d(
                     "rmsnorm_row",
                     vec![xb, out.clone()],
@@ -338,6 +541,7 @@ impl NativeExec {
                 let n = numel(&g.nodes[id].dims);
                 let out = self.alloc(n as usize * 4);
                 let (gb, ub) = (self.use_buf(*gg), self.use_buf(*up));
+                self.guard_write_overlap(id, &out, &[&gb, &ub]);
                 self.push1d(
                     "silu_mul",
                     vec![gb, ub, out.clone()],
@@ -388,6 +592,7 @@ impl NativeExec {
                     let meta = meta_of(&rr.layout).expect("pointwise meta");
                     let out = self.alloc(n as usize * 4);
                     let sb = self.use_buf(rr.src);
+                    self.guard_write_overlap(id, &out, &[&sb]);
                     self.push1d(
                         kernel,
                         vec![sb, out.clone()],
@@ -447,17 +652,14 @@ impl NativeExec {
         self.elided += self.pending.len();
     }
 
-    fn emit_attn(
-        &mut self,
+    fn attn_setup(
+        &self,
         g: &GraphIr,
         id: usize,
-        _q: usize,
-        _kc: usize,
-        _v: usize,
         mask: usize,
         scale: f32,
         sc: usize,
-    ) {
+    ) -> ([i32; 25], bool, usize, usize, usize) {
         let NodeKind::Move { a: qa, b: Some(kb), kext: hd, .. } = &g.nodes[sc].kind else {
             panic!("attn scores node shape")
         };
@@ -466,9 +668,9 @@ impl NativeExec {
         };
         let scd = &g.nodes[sc].dims;
         let (kv, grp, s, ctx) = (scd[0], scd[1], scd[2], scd[3]);
-        let qa = &resolve_read(g, &self.hazard, qa);
-        let kb = &resolve_read(g, &self.hazard, kb);
-        let vb = &resolve_read(g, &self.hazard, vb);
+        let qa = resolve_read(g, &self.hazard, qa);
+        let kb = resolve_read(g, &self.hazard, kb);
+        let vb = resolve_read(g, &self.hazard, vb);
         let (_, qst) = axes_of(&qa.layout);
         let (_, kst) = axes_of(&kb.layout);
         let (_, vst) = axes_of(&vb.layout);
@@ -499,18 +701,33 @@ impl NativeExec {
             && qst[4] == 1
             && kst[4] == 1
             && [qst[0], qst[1], qst[2], kst[0], kst[3]].iter().all(|st| st % 4 == 0);
-        let (split, vec) = self.backend.tune_attn(&p, vec_ok);
-        p[24] = (split | (vec << 8)) as i32;
+        (p, vec_ok, qa.src, kb.src, vb.src)
+    }
+
+    fn emit_attn(
+        &mut self,
+        g: &GraphIr,
+        id: usize,
+        _q: usize,
+        _kc: usize,
+        _v: usize,
+        mask: usize,
+        scale: f32,
+        sc: usize,
+    ) {
+        let (mut p, vec_ok, qsrc, ksrc, vsrc) = self.attn_setup(g, id, mask, scale, sc);
+        let (kind, x, y, _ms) = self.backend.tune_attn(&p, vec_ok);
+        p[24] = (x | (y << 8) | (kind << 16)) as i32;
         let n_out = numel(&g.nodes[id].dims);
         let out = self.alloc(n_out as usize * 4);
         let (qbuf, kbuf, vbuf, mbuf) = (
-            self.use_buf(qa.src),
-            self.use_buf(kb.src),
-            self.use_buf(vb.src),
+            self.use_buf(qsrc),
+            self.use_buf(ksrc),
+            self.use_buf(vsrc),
             self.use_buf(mask),
         );
-        let jobs = (kv * grp * s) as u64;
-        let threads = jobs.div_ceil(8 / split as u64) * 256;
+        self.guard_write_overlap(id, &out, &[&qbuf, &kbuf, &vbuf, &mbuf]);
+        let (threads, _tg) = crate::metal_backend::CuteMetal::attn_grid(&p, kind, x);
         self.tape.push(Tape::Run1d {
             kernel: "attn_online",
             bufs: vec![qbuf, kbuf, vbuf, mbuf, out.clone()],
@@ -532,6 +749,7 @@ impl NativeExec {
         let mb = meta_from_axes(&shb, &stb, shb.len() - 1).expect("bin meta b");
         let out = self.alloc(n as usize * 4);
         let (ab, bb) = (self.use_buf(a.src), self.use_buf(b.src));
+        self.guard_write_overlap(id, &out, &[&ab, &bb]);
         self.push1d(
             kernel,
             vec![ab, bb, out.clone()],
@@ -547,6 +765,7 @@ impl NativeExec {
         let meta = meta_of(&a.layout).expect("reduce meta");
         let out = self.alloc(n as usize * 4);
         let sb = self.use_buf(a.src);
+        self.guard_write_overlap(id, &out, &[&sb]);
         self.push1d(
             "reduce_sum_l",
             vec![sb, out.clone()],
@@ -570,6 +789,11 @@ impl NativeExec {
         }
         let out = self.alloc(n as usize * 4);
         let sb = self.use_buf(a.src);
+        {
+            let mut reads: Vec<&Buffer> = vec![&sb];
+            reads.extend(ibufs.iter().map(|(b, _)| b));
+            self.guard_write_overlap(id, &out, &reads);
+        }
         self.xcopy(sb, out.clone(), ibufs, n, rmeta, flat_meta(n), rspec, [0; 8]);
         self.bufs[id] = Some(out);
     }
@@ -611,90 +835,30 @@ impl NativeExec {
             ibufs.push((self.use_buf(ir.idx), meta_of(&ir.idx_layout).expect("widx meta")));
         }
         let sb = self.use_buf(a.src);
+        {
+            let mut reads: Vec<&Buffer> = vec![&sb];
+            reads.extend(ibufs.iter().map(|(b, _)| b));
+            self.guard_write_overlap(id, &out, &reads);
+        }
         self.xcopy(sb, out.clone(), ibufs, src_n, rmeta, wmeta, [0; 8], wspec);
         self.bufs[id] = Some(out);
     }
 
     fn emit_contract(&mut self, _g: &GraphIr, id: usize, a: &Read, b: &Read, kext: i64, dims: &[i64]) {
-        let (sha, sta) = axes_of(&a.layout);
-        let (_shb, stb) = axes_of(&b.layout);
-        let rank = sha.len();
-        let kax = rank - 1;
-        assert_eq!(sha[kax], kext, "k axis extent");
-        let mut m_ax = None;
-        let mut n_ax = None;
-        let mut b_axes: Vec<usize> = Vec::new();
-        for ax in 0..kax {
-            if dims[ax] == 1 {
-                continue;
-            }
-            match (sta[ax] != 0, stb[ax] != 0) {
-                (true, false) => {
-                    if m_ax.is_none() {
-                        m_ax = Some(ax);
-                    } else {
-                        b_axes.push(ax);
-                    }
-                }
-                (false, true) => {
-                    if n_ax.is_none() {
-                        n_ax = Some(ax);
-                    } else {
-                        b_axes.push(ax);
-                    }
-                }
-                _ => b_axes.push(ax),
-            }
-        }
-        for ax in 0..kax {
-            if dims[ax] == 1 {
-                continue;
-            }
-            if m_ax.is_none() && !b_axes.contains(&ax) && Some(ax) != n_ax {
-                m_ax = Some(ax);
-            }
-        }
-        let after = |ax: usize| -> i64 { dims[ax + 1..].iter().product() };
-        let (m, am_s, cm_s) = match m_ax {
-            Some(ax) => (dims[ax], sta[ax], after(ax)),
-            None => (1, 0, 0),
-        };
-        let (nn, bn_s, cn_s) = match n_ax {
-            Some(ax) => (dims[ax], stb[ax], after(ax)),
-            None => (1, 0, 0),
-        };
-        let mut batch = vec![b_axes.len() as i32];
-        let mut nbatch = 1i64;
-        for ax in &b_axes {
-            batch.extend([
-                dims[*ax] as i32,
-                sta[*ax] as i32,
-                stb[*ax] as i32,
-                after(*ax) as i32,
-            ]);
-            nbatch *= dims[*ax];
-        }
-        if let (Some(ma), Some(na)) = (m_ax, n_ax) {
-            if let Some(maxb) = b_axes.iter().max() {
-                assert!(*maxb < ma.min(na), "batch axes must be outermost");
-            }
-        }
+        let cl = classify_contract(a, b, kext, dims);
+        let (m, nn, ap, bp, cp, batch, nbatch) =
+            (cl.m, cl.n, cl.ap, cl.bp, cl.cp, cl.batch, cl.nbatch);
         let n_out = numel(dims);
-        assert_eq!(n_out, m * nn * nbatch, "contract extents");
-        let ap = [0, am_s as i32, sta[kax] as i32, 0];
-        let bp = [0, stb[kax] as i32, bn_s as i32, 0];
-        let crs = if m_ax.is_some() { cm_s } else { 1 };
-        let ccs = if n_ax.is_some() { cn_s } else { 1 };
-        let cp = [0, crs as i32, ccs as i32, 0];
         let out = self.alloc(n_out as usize * 4);
         let (ab, bb) = (self.use_buf(a.src), self.use_buf(b.src));
+        self.guard_write_overlap(id, &out, &[&ab, &bb]);
         if nbatch == 1 && m == 1 && (bp[2] == 1 || bp[1] == 1) {
             self.backend
                 .tune_gemv(kext as usize, nn as usize, &ab, &bb, ap, bp);
         }
-        if nbatch == 1 && m > 1 && std::env::var("GENERAL_ONLY").is_err() {
+        if m > 1 && std::env::var("GENERAL_ONLY").is_err() {
             self.backend
-                .tune_gemm(m as usize, kext as usize, nn as usize, ap, bp, cp);
+                .tune_gemm(m, kext as usize, nn, ap, bp, cp, &batch, nbatch);
         }
         self.tape.push(Tape::Mm {
             a: ab,
@@ -713,17 +877,40 @@ impl NativeExec {
         self.bufs[id] = Some(out);
     }
 
+    pub fn dump_tape(&self) {
+        use std::collections::BTreeMap;
+        let mut c: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut mm = 0;
+        for t in &self.tape {
+            match t {
+                Tape::Run1d { kernel, .. } => *c.entry(kernel).or_default() += 1,
+                Tape::Mm { .. } => mm += 1,
+            }
+        }
+        eprintln!("tape: {} entries, Mm={mm}", self.tape.len());
+        for (k, v) in &c {
+            eprintln!("  {k} x{v}");
+        }
+    }
+
     pub fn replay(&self) {
         let cb = self.backend.owned_command_buffer();
         for t in &self.tape {
             match t {
                 Tape::Run1d { kernel, bufs, metas, scalars, specs, progs, n } => {
-                    let enc = cb.new_compute_command_encoder();
+                    let enc = self.backend.enc(&cb, kernel);
+                    let mut tg_override = None;
                     if *kernel == "attn_online" {
                         let pr = progs[0].1;
-                        let split = (pr[24] & 0xff).max(1) as u32;
-                        let vec = ((pr[24] >> 8) & 0xff).max(1) as u32;
-                        let pipe = self.backend.attn_pipeline(split, vec);
+                        let kind = ((pr[24] >> 16) & 0xff) as u32;
+                        let x = (pr[24] & 0xff).max(1) as u32;
+                        let y = ((pr[24] >> 8) & 0xff).max(1) as u32;
+                        let pipe = if kind == 1 {
+                            tg_override = Some(32 * x as u64);
+                            self.backend.flash_pipeline(x, y)
+                        } else {
+                            self.backend.attn_pipeline(x, y)
+                        };
                         enc.set_compute_pipeline_state(&pipe);
                     } else {
                         enc.set_compute_pipeline_state(self.backend.pipeline(kernel));
@@ -743,7 +930,7 @@ impl NativeExec {
                     for (slot, pr) in progs {
                         enc.set_bytes(*slot, 100, pr.as_ptr() as *const _);
                     }
-                    let tg = 256u64.min((*n).max(1));
+                    let tg = tg_override.unwrap_or(256u64.min((*n).max(1)));
                     enc.dispatch_threads(
                         metal::MTLSize::new((*n).max(1), 1, 1),
                         metal::MTLSize::new(tg, 1, 1),

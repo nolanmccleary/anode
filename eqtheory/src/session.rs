@@ -78,6 +78,59 @@ fn main() {
     );
     println!("prefill last-token logits[0..4]: {:?}", &last_logits[..4]);
 
+    if std::env::var("SESSION_TIMED").is_ok() {
+        pre.backend.begin_sampling(256);
+        let (c1, g1) = pre.backend.sample_timestamps();
+        pre.replay();
+        let (c2, g2) = pre.backend.sample_timestamps();
+        if let Some(ctx) = pre.backend.end_sampling() {
+            let nsamp = ctx.labels.len();
+            let ticks = ctx
+                .buf
+                .resolve_counter_range(metal::NSRange { location: 0, length: (nsamp * 2) as u64 });
+            let scale = (c2 - c1) as f64 / (g2 - g1).max(1) as f64;
+            let to_ms = |t: u64| t as f64 * scale / 1e6;
+            let mut agg: HashMap<String, (usize, f64)> = HashMap::new();
+            let mut gaps = 0f64;
+            let mut overlap = 0f64;
+            let mut ksum = 0f64;
+            let mut first_start: Option<u64> = None;
+            let mut prev_end: Option<u64> = None;
+            for i in 0..nsamp {
+                let s0 = ticks[2 * i];
+                let e0 = ticks[2 * i + 1];
+                if s0 == u64::MAX || e0 == u64::MAX || e0 <= s0 {
+                    continue;
+                }
+                let d = to_ms(e0 - s0);
+                ksum += d;
+                let e = agg.entry(ctx.labels[i].clone()).or_insert((0, 0.0));
+                e.0 += 1;
+                e.1 += d;
+                if first_start.is_none() {
+                    first_start = Some(s0);
+                }
+                if let Some(pe) = prev_end {
+                    if s0 > pe {
+                        gaps += to_ms(s0 - pe);
+                    } else {
+                        overlap += to_ms(pe - s0);
+                    }
+                }
+                prev_end = Some(e0);
+            }
+            let mut rows: Vec<(String, (usize, f64))> = agg.into_iter().collect();
+            rows.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap());
+            for (name, (cnt, ms)) in &rows {
+                println!("timed: {name:12} x{cnt:3} {ms:8.2} ms");
+            }
+            let span = to_ms(prev_end.unwrap_or(0) - first_start.unwrap_or(0));
+            println!(
+                "timed: kernels {ksum:.1} ms, gaps {gaps:.1} ms, overlap {overlap:.1} ms, span {span:.1} ms"
+            );
+        }
+    }
+
     let dcfg = NativeCfg { seq: 1, prev: (P - 1) as i64, ..base };
     let dec_model = build(&dcfg, (0..C as i32).collect());
     let mut dec_inputs = inputs.clone();
@@ -102,6 +155,7 @@ fn main() {
     let mut final_logits: Vec<f32> = Vec::new();
     let mut best = f64::INFINITY;
     let t3 = Instant::now();
+    if std::env::var("DUMP_TAPE").is_ok() { dec.dump_tape(); }
     for (t, tok) in toks.iter().enumerate() {
         let pos = (P + t) as i64;
         dec.poke_i32(dec_model.ids.id, &[*tok]);

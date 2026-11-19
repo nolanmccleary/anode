@@ -69,6 +69,7 @@ pub const KERNELS: &[(&str, NodeType)] = &[
 
 pub const TEMPLATE_KERNELS: &[(&str, NodeType)] = &[
     ("gemm_sg", NodeType::Move),
+    ("attn_flash", NodeType::Move),
     ("gemv_t", NodeType::Move),
     ("gemv_rows_t", NodeType::Move),
     ("gemv_sg_t", NodeType::Move),
@@ -441,6 +442,9 @@ constant uint GSGM_FC [[function_constant(4)]];
 constant uint GSGN_FC [[function_constant(5)]];
 constant uint GATM_FC [[function_constant(6)]];
 constant uint GATN_FC [[function_constant(7)]];
+constant uint GSTG_FC [[function_constant(10)]];
+constant uint FL_SGS [[function_constant(8)]];
+constant uint FL_BK [[function_constant(9)]];
 constant uint ATTN_SPLIT_RAW [[function_constant(2)]];
 constant uint ATTN_VEC_RAW [[function_constant(3)]];
 constant uint ATTN_SPLIT = is_function_constant_defined(ATTN_SPLIT_RAW) ? ATTN_SPLIT_RAW : 1;
@@ -807,7 +811,9 @@ kernel void gemm_sg(
     constant int4&      ap   [[buffer(4)]],
     constant int4&      bp   [[buffer(5)]],
     constant int4&      cp   [[buffer(6)]],
+    constant int*       bat  [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
     uint sgid [[simdgroup_index_in_threadgroup]])
 {
     int k = dims.y;
@@ -815,6 +821,17 @@ kernel void gemm_sg(
     int sgn = int(sgid) % int(GSGN_FC);
     int i0 = int(tgid.y) * int(GSGM_FC * GATM_FC * 8u) + sgm * int(GATM_FC) * 8;
     int j0 = int(tgid.x) * int(GSGN_FC * GATN_FC * 8u) + sgn * int(GATN_FC) * 8;
+    long aboff = 0, bboff = 0, cboff = 0;
+    int nax = bat[0];
+    int rz = int(tgid.z);
+    for (int bx = 0; bx < nax; ++bx) {
+        int sz = bat[1 + 4 * bx];
+        int ii = rz % sz;
+        rz /= sz;
+        aboff += (long)ii * bat[2 + 4 * bx];
+        bboff += (long)ii * bat[3 + 4 * bx];
+        cboff += (long)ii * bat[4 + 4 * bx];
+    }
     long am = ap.y, ak = ap.z;
     long bk = bp.y, bn = bp.z;
     bool at = ak != 1;
@@ -825,27 +842,174 @@ kernel void gemm_sg(
     for (uint i = 0; i < GATM_FC; ++i)
         for (uint j = 0; j < GATN_FC; ++j)
             acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    for (int kk = 0; kk < k; kk += 8) {
-        simdgroup_float8x8 af[4];
-        simdgroup_float8x8 bf[4];
-        for (uint i = 0; i < GATM_FC; ++i) {
-            long base = long(ap.x) + (long(i0) + long(i) * 8) * am + long(kk) * ak;
-            simdgroup_load(af[i], A + base, lda, ulong2(0, 0), at);
+    if (GSTG_FC == 1) {
+        threadgroup float As[128 * 16];
+        threadgroup float Bs[16 * 128];
+        int bmq = int(GSGM_FC * GATM_FC) * 8;
+        int bnq = int(GSGN_FC * GATN_FC) * 8;
+        int i0g = int(tgid.y) * bmq;
+        int j0g = int(tgid.x) * bnq;
+        uint nth = 32 * GSGM_FC * GSGN_FC;
+        uint tid = sgid * 32 + lane;
+        int lsgm = int(sgid) / int(GSGN_FC);
+        int lsgn = int(sgid) % int(GSGN_FC);
+        for (int kk = 0; kk < k; kk += 16) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint x = tid; x < uint(bmq * 16); x += nth) {
+                int r = int(x) / 16;
+                int c = int(x) % 16;
+                As[r * 16 + c] = A[long(ap.x) + aboff + (long)(i0g + r) * am + (long)(kk + c) * ak];
+            }
+            for (uint x = tid; x < uint(16 * bnq); x += nth) {
+                int c = int(x) / bnq;
+                int j = int(x) % bnq;
+                Bs[c * bnq + j] = B[long(bp.x) + bboff + (long)(kk + c) * bk + (long)(j0g + j) * bn];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int kc2 = 0; kc2 < 2; ++kc2) {
+                simdgroup_float8x8 af[4];
+                simdgroup_float8x8 bf[4];
+                for (uint i = 0; i < GATM_FC; ++i)
+                    simdgroup_load(af[i], &As[(lsgm * int(GATM_FC) + int(i)) * 8 * 16 + kc2 * 8], 16, ulong2(0, 0), false);
+                for (uint j = 0; j < GATN_FC; ++j)
+                    simdgroup_load(bf[j], &Bs[kc2 * 8 * bnq + (lsgn * int(GATN_FC) + int(j)) * 8], ulong(bnq), ulong2(0, 0), false);
+                for (uint i = 0; i < GATM_FC; ++i)
+                    for (uint j = 0; j < GATN_FC; ++j)
+                        simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+            }
         }
-        for (uint j = 0; j < GATN_FC; ++j) {
-            long base = long(bp.x) + long(kk) * bk + (long(j0) + long(j) * 8) * bn;
-            simdgroup_load(bf[j], B + base, ldb, ulong2(0, 0), bt);
+    } else {
+        for (int kk = 0; kk < k; kk += 8) {
+            simdgroup_float8x8 af[4];
+            simdgroup_float8x8 bf[4];
+            for (uint i = 0; i < GATM_FC; ++i) {
+                long base = long(ap.x) + aboff + (long(i0) + long(i) * 8) * am + long(kk) * ak;
+                simdgroup_load(af[i], A + base, lda, ulong2(0, 0), at);
+            }
+            for (uint j = 0; j < GATN_FC; ++j) {
+                long base = long(bp.x) + bboff + long(kk) * bk + (long(j0) + long(j) * 8) * bn;
+                simdgroup_load(bf[j], B + base, ldb, ulong2(0, 0), bt);
+            }
+            for (uint i = 0; i < GATM_FC; ++i)
+                for (uint j = 0; j < GATN_FC; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
         }
-        for (uint i = 0; i < GATM_FC; ++i)
-            for (uint j = 0; j < GATN_FC; ++j)
-                simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
     }
     long cm = cp.y;
     for (uint i = 0; i < GATM_FC; ++i)
         for (uint j = 0; j < GATN_FC; ++j) {
-            long base = long(cp.x) + (long(i0) + long(i) * 8) * cm + long(j0) + long(j) * 8;
+            long base = long(cp.x) + cboff + (long(i0) + long(i) * 8) * cm + long(j0) + long(j) * 8;
             simdgroup_store(acc[i][j], C + base, ulong(cm), ulong2(0, 0));
         }
+}
+
+kernel void attn_flash(
+    device const float* Q    [[buffer(0)]],
+    device const float* Kc   [[buffer(1)]],
+    device const float* Vc   [[buffer(2)]],
+    device const float* BIAS [[buffer(3)]],
+    device float*       OUT  [[buffer(4)]],
+    constant int*       p    [[buffer(5)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    int G = p[1], S = p[2], CTX = p[3], HD = p[4];
+    int head_blocks = S / (8 * int(FL_SGS));
+    int head = int(tgid) / head_blocks;
+    int qb = int(tgid) % head_blocks;
+    int q0 = qb * 8 * int(FL_SGS) + int(sgid) * 8;
+    int kv = head / G;
+    int g = head % G;
+    long qoff = p[5] + (long)kv * p[6] + (long)g * p[7] + (long)q0 * p[8];
+    long koff = p[10] + (long)kv * p[11];
+    long voff = p[14] + (long)kv * p[15];
+    long boff = p[18] + (long)kv * p[19] + (long)g * p[20] + (long)q0 * p[21];
+    float scale = as_type<float>(p[23]);
+    int nh = HD / 8;
+    threadgroup float st[8][8 * 32];
+    threadgroup float ds[8][64];
+    threadgroup float ms[8][8];
+    threadgroup float ls[8][8];
+    simdgroup_float8x8 Qa[8];
+    simdgroup_float8x8 Oa[8];
+    for (int e = 0; e < nh; ++e) {
+        simdgroup_load(Qa[e], Q + qoff + e * 8, ulong(p[8]), ulong2(0, 0), false);
+        Oa[e] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+    if (lane < 8) {
+        ms[sgid][lane] = -INFINITY;
+        ls[sgid][lane] = 0.0f;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    for (int c0 = 0; c0 < CTX; c0 += int(FL_BK)) {
+        for (int j = 0; j < int(FL_BK) / 8; ++j) {
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int e = 0; e < nh; ++e) {
+                simdgroup_float8x8 kT;
+                simdgroup_load(kT, Kc + koff + (long)(c0 + 8 * j) * p[12] + e * 8, ulong(p[12]), ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(acc, Qa[e], kT, acc);
+            }
+            simdgroup_store(acc, &st[sgid][j * 8], ulong(FL_BK), ulong2(0, 0), false);
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane < 8) {
+            int r = int(lane);
+            long br = boff + (long)r * p[21];
+            float bm = -INFINITY;
+            for (int c = 0; c < int(FL_BK); ++c) {
+                float x = st[sgid][r * int(FL_BK) + c] * scale + BIAS[br + (long)(c0 + c) * p[22]];
+                bm = max(bm, x);
+            }
+            float mn = max(ms[sgid][r], bm);
+            float corr = exp(ms[sgid][r] - mn);
+            float lsum = 0.0f;
+            for (int c = 0; c < int(FL_BK); ++c) {
+                float x = st[sgid][r * int(FL_BK) + c] * scale + BIAS[br + (long)(c0 + c) * p[22]];
+                float pe = exp(x - mn);
+                st[sgid][r * int(FL_BK) + c] = pe;
+                lsum += pe;
+            }
+            ls[sgid][r] = ls[sgid][r] * corr + lsum;
+            ms[sgid][r] = mn;
+            for (int cc = 0; cc < 8; ++cc) {
+                ds[sgid][r * 8 + cc] = (cc == r) ? corr : 0.0f;
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 D;
+        simdgroup_load(D, &ds[sgid][0], 8, ulong2(0, 0), false);
+        for (int e = 0; e < nh; ++e) {
+            simdgroup_float8x8 t;
+            simdgroup_multiply(t, D, Oa[e]);
+            Oa[e] = t;
+        }
+        for (int jj = 0; jj < int(FL_BK) / 8; ++jj) {
+            simdgroup_float8x8 Pa;
+            simdgroup_load(Pa, &st[sgid][jj * 8], ulong(FL_BK), ulong2(0, 0), false);
+            for (int e = 0; e < nh; ++e) {
+                simdgroup_float8x8 Vb;
+                simdgroup_load(Vb, Vc + voff + (long)(c0 + 8 * jj) * p[16] + e * 8, ulong(p[16]), ulong2(0, 0), false);
+                simdgroup_multiply_accumulate(Oa[e], Pa, Vb, Oa[e]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lane < 8) {
+        int r = int(lane);
+        float inv = 1.0f / ls[sgid][r];
+        for (int cc = 0; cc < 8; ++cc) {
+            ds[sgid][r * 8 + cc] = (cc == r) ? inv : 0.0f;
+        }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 Dn;
+    simdgroup_load(Dn, &ds[sgid][0], 8, ulong2(0, 0), false);
+    for (int e = 0; e < nh; ++e) {
+        simdgroup_float8x8 t;
+        simdgroup_multiply(t, Dn, Oa[e]);
+        simdgroup_store(t, OUT + (long)(head * S + q0) * HD + e * 8, ulong(HD), ulong2(0, 0), false);
+    }
 }
 
 kernel void attn_online(

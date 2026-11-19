@@ -12,9 +12,16 @@ pub struct CuteMetal {
     gemv_choice: std::cell::RefCell<HashMap<(usize, usize, bool), (u32, u32, u32, u64)>>,
     rows_variants: std::cell::RefCell<HashMap<u32, ComputePipelineState>>,
     attn_variants: std::cell::RefCell<HashMap<(u32, u32), ComputePipelineState>>,
-    attn_choice: std::cell::RefCell<HashMap<(usize, usize, usize, bool), (u32, u32)>>,
-    gemm_variants: std::cell::RefCell<HashMap<(u32, u32, u32, u32), ComputePipelineState>>,
-    gemm_choice: std::cell::RefCell<HashMap<(usize, usize, usize), Option<(u32, u32, u32, u32)>>>,
+    attn_choice: std::cell::RefCell<HashMap<(usize, usize, usize, bool), (u32, u32, u32, f64)>>,
+    gemm_variants: std::cell::RefCell<HashMap<(u32, u32, u32, u32, u32), ComputePipelineState>>,
+    gemm_choice: std::cell::RefCell<HashMap<(usize, usize, usize, i64), Option<(u32, u32, u32, u32, u32)>>>,
+    gemm_ms: std::cell::RefCell<HashMap<(usize, usize, usize, i64), f64>>,
+    sample_ctx: std::cell::RefCell<Option<SampleCtx>>,
+}
+
+pub struct SampleCtx {
+    pub buf: metal::CounterSampleBuffer,
+    pub labels: Vec<String>,
 }
 
 impl CuteMetal {
@@ -56,13 +63,15 @@ impl CuteMetal {
             attn_choice: Default::default(),
             gemm_variants: Default::default(),
             gemm_choice: Default::default(),
+            gemm_ms: Default::default(),
+            sample_ctx: Default::default(),
         };
         let _ = me.gemv_pipeline(4, 8);
         let _ = me.gemv_rows_pipeline(4);
         me
     }
 
-    pub fn gemm_pipeline(&self, v: (u32, u32, u32, u32)) -> ComputePipelineState {
+    pub fn gemm_pipeline(&self, v: (u32, u32, u32, u32, u32)) -> ComputePipelineState {
         if let Some(p) = self.gemm_variants.borrow().get(&v) {
             return p.clone();
         }
@@ -74,6 +83,11 @@ impl CuteMetal {
                 (4 + i) as u64,
             );
         }
+        fcv.set_constant_value_at_index(
+            &v.4 as *const u32 as *const c_void,
+            metal::MTLDataType::UInt,
+            10,
+        );
         let f = self.lib.get_function("gemm_sg", Some(fcv)).expect("gemm_sg fc");
         let p = self
             .device
@@ -87,7 +101,7 @@ impl CuteMetal {
     fn encode_gemm_sg(
         &self,
         cb: &metal::CommandBufferRef,
-        v: (u32, u32, u32, u32),
+        v: (u32, u32, u32, u32, u32),
         a: &Buffer,
         b: &Buffer,
         c: &Buffer,
@@ -97,9 +111,11 @@ impl CuteMetal {
         ap: [i32; 4],
         bp: [i32; 4],
         cp: [i32; 4],
+        batch: &[i32],
+        nbatch: i64,
     ) {
         let pipe = self.gemm_pipeline(v);
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "gemv_sg");
         enc.set_compute_pipeline_state(&pipe);
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -109,35 +125,58 @@ impl CuteMetal {
         enc.set_bytes(4, 16, ap.as_ptr() as *const c_void);
         enc.set_bytes(5, 16, bp.as_ptr() as *const c_void);
         enc.set_bytes(6, 16, cp.as_ptr() as *const c_void);
+        enc.set_bytes(7, (batch.len() * 4) as u64, batch.as_ptr() as *const c_void);
         let bm = (v.0 * v.2 * 8) as u64;
         let bn = (v.1 * v.3 * 8) as u64;
         enc.dispatch_thread_groups(
-            MTLSize::new(n as u64 / bn, m as u64 / bm, 1),
+            MTLSize::new(n as u64 / bn, m as u64 / bm, nbatch as u64),
             MTLSize::new((32 * v.0 * v.1) as u64, 1, 1),
         );
         enc.end_encoding();
     }
 
-    pub fn tune_gemm(&self, m: usize, k: usize, n: usize, ap: [i32; 4], bp: [i32; 4], cp: [i32; 4]) {
-        let key = (m, k, n);
+    #[allow(clippy::too_many_arguments)]
+    pub fn tune_gemm(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        ap: [i32; 4],
+        bp: [i32; 4],
+        cp: [i32; 4],
+        batch: &[i32],
+        nbatch: i64,
+    ) -> f64 {
+        let key = (m, k, n, nbatch);
         if self.gemm_choice.borrow().contains_key(&key) {
-            return;
+            return *self.gemm_ms.borrow().get(&key).unwrap_or(&f64::INFINITY);
         }
         let ap0 = [0, ap[1], ap[2], 0];
         let bp0 = [0, bp[1], bp[2], 0];
         let cp0 = [0, cp[1], cp[2], 0];
         let plan = crate::atoms::mma_plan(&crate::atoms::SG_F32_8X8X8, m, k, n, ap0, bp0, cp0);
-        let candidates = crate::atoms::mma_candidates(m, n);
+        let candidates = crate::atoms::mma_candidates(m, n, k);
         if plan.is_none() || candidates.is_empty() || std::env::var("GEMM_NOTUNE").is_ok() {
             self.gemm_choice.borrow_mut().insert(key, None);
-            return;
+            self.gemm_ms.borrow_mut().insert(key, f64::INFINITY);
+            return f64::INFINITY;
         }
-        let foot = |s1: i32, n1: usize, s2: i32, n2: usize| -> usize {
+        let foot2 = |s1: i32, n1: usize, s2: i32, n2: usize| -> usize {
             1 + s1.unsigned_abs() as usize * (n1 - 1) + s2.unsigned_abs() as usize * (n2 - 1)
         };
-        let afoot = (foot(ap[1], m, ap[2], k) + 3) & !3;
-        let bfoot = (foot(bp[1], k, bp[2], n) + 3) & !3;
-        let cfoot = foot(cp[1], m, 1, n);
+        let bfootx = |col: usize| -> usize {
+            let mut f = 0usize;
+            let nax = batch[0] as usize;
+            for bx in 0..nax {
+                let sz = batch[1 + 4 * bx] as usize;
+                let st = batch[1 + 4 * bx + col].unsigned_abs() as usize;
+                f += (sz - 1) * st;
+            }
+            f
+        };
+        let afoot = (foot2(ap[1], m, ap[2], k) + bfootx(1) + 3) & !3;
+        let bfoot = (foot2(bp[1], k, bp[2], n) + bfootx(2) + 3) & !3;
+        let cfoot = foot2(cp[1], m, 1, n) + bfootx(3);
         let copies = (96_000_000usize / ((afoot + bfoot) * 4)).clamp(1, 8);
         let ascratch = self.alloc_bytes(afoot * 4 * copies);
         let bscratch = self.alloc_bytes(bfoot * 4 * copies);
@@ -146,8 +185,8 @@ impl CuteMetal {
             std::ptr::write_bytes(ascratch.contents() as *mut u8, 0, afoot * 4 * copies);
             std::ptr::write_bytes(bscratch.contents() as *mut u8, 0, bfoot * 4 * copies);
         }
-        let mut best: (f64, Option<(u32, u32, u32, u32)>) = (f64::INFINITY, None);
-        let mut race = |v: Option<(u32, u32, u32, u32)>, best: &mut (f64, Option<(u32, u32, u32, u32)>)| {
+        let mut best: (f64, Option<(u32, u32, u32, u32, u32)>) = (f64::INFINITY, None);
+        let mut race = |v: Option<(u32, u32, u32, u32, u32)>, best: &mut (f64, Option<(u32, u32, u32, u32, u32)>)| {
             let run = |iters: usize, offs: usize| {
                 let cb = self.queue.new_command_buffer();
                 for it in 0..iters {
@@ -157,8 +196,14 @@ impl CuteMetal {
                     app[0] = (c * afoot) as i32;
                     bpp[0] = (c * bfoot) as i32;
                     match v {
-                        Some(vv) => self.encode_gemm_sg(cb, vv, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0),
-                        None => self.matmul_into(cb, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0),
+                        Some(vv) => self.encode_gemm_sg(cb, vv, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0, batch, nbatch),
+                        None => {
+                            if nbatch > 1 {
+                                self.bmm_scalar(cb, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0, batch, nbatch as u64);
+                            } else {
+                                self.matmul_into(cb, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0);
+                            }
+                        }
                     }
                 }
                 cb.commit();
@@ -178,13 +223,33 @@ impl CuteMetal {
             race(Some(v), &mut best);
         }
         if std::env::var("GEMMTUNE").is_ok() {
-            let gf = 2.0 * m as f64 * k as f64 * n as f64 / (best.0 / 1e3) / 1e9;
+            let gf = 2.0 * (nbatch.max(1) as f64) * m as f64 * k as f64 * n as f64 / (best.0 / 1e3) / 1e9;
             eprintln!(
-                "gemm tune M={m} K={k} N={n}: {:?} ({:.3} ms, {:.0} GF/s; scalar {:.3} ms)",
+                "gemm tune M={m} K={k} N={n} B={nbatch}: {:?} ({:.3} ms, {:.0} GF/s; scalar {:.3} ms)",
                 best.1, best.0, gf, scalar_ms
             );
         }
         self.gemm_choice.borrow_mut().insert(key, best.1);
+        self.gemm_ms.borrow_mut().insert(key, best.0);
+        best.0
+    }
+
+
+    pub fn flash_pipeline(&self, sgs: u32, bk: u32) -> ComputePipelineState {
+        let key = (1000 + sgs, bk);
+        if let Some(p) = self.attn_variants.borrow().get(&key) {
+            return p.clone();
+        }
+        let fcv = metal::FunctionConstantValues::new();
+        fcv.set_constant_value_at_index(&sgs as *const u32 as *const c_void, metal::MTLDataType::UInt, 8);
+        fcv.set_constant_value_at_index(&bk as *const u32 as *const c_void, metal::MTLDataType::UInt, 9);
+        let f = self.lib.get_function("attn_flash", Some(fcv)).expect("attn_flash fc");
+        let p = self
+            .device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("attn_flash pipeline");
+        self.attn_variants.borrow_mut().insert(key, p.clone());
+        p
     }
 
     pub fn attn_pipeline(&self, split: u32, vec: u32) -> ComputePipelineState {
@@ -212,33 +277,50 @@ impl CuteMetal {
         p
     }
 
+    pub fn attn_grid(p: &[i32; 25], kind: u32, x: u32) -> (u64, u64) {
+        let jobs = (p[0] as i64 * p[1] as i64 * p[2] as i64) as u64;
+        if kind == 1 {
+            let heads = (p[0] * p[1]) as u64;
+            let tgs = heads * (p[2] as u64 / (8 * x as u64));
+            (tgs * 32 * x as u64, 32 * x as u64)
+        } else {
+            (jobs.div_ceil(8 / x as u64) * 256, 256)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn encode_attn(
         &self,
         cb: &metal::CommandBufferRef,
-        pipe: &ComputePipelineState,
+        kind: u32,
+        x: u32,
+        y: u32,
         q: &Buffer,
         k: &Buffer,
         v: &Buffer,
         bias: &Buffer,
         out: &Buffer,
         p: &[i32; 25],
-        split: u32,
     ) {
-        let enc = cb.new_compute_command_encoder();
-        enc.set_compute_pipeline_state(pipe);
+        let pipe = if kind == 1 {
+            self.flash_pipeline(x, y)
+        } else {
+            self.attn_pipeline(x, y)
+        };
+        let enc = self.enc(cb, "attn");
+        enc.set_compute_pipeline_state(&pipe);
         enc.set_buffer(0, Some(q), 0);
         enc.set_buffer(1, Some(k), 0);
         enc.set_buffer(2, Some(v), 0);
         enc.set_buffer(3, Some(bias), 0);
         enc.set_buffer(4, Some(out), 0);
         enc.set_bytes(5, 100, p.as_ptr() as *const c_void);
-        let jobs = (p[0] * p[1] * p[2]) as u64;
-        let threads = jobs.div_ceil(8 / split as u64) * 256;
-        enc.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(256, 1, 1));
+        let (threads, tg) = Self::attn_grid(p, kind, x);
+        enc.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(tg, 1, 1));
         enc.end_encoding();
     }
 
-    pub fn tune_attn(&self, p: &[i32; 25], vec_ok: bool) -> (u32, u32) {
+    pub fn tune_attn(&self, p: &[i32; 25], vec_ok: bool) -> (u32, u32, u32, f64) {
         let (kv, g, s, ctx, hd) = (
             p[0] as usize,
             p[1] as usize,
@@ -253,8 +335,8 @@ impl CuteMetal {
         }
         let vec = if vec_ok { 4u32 } else { 1u32 };
         if std::env::var("ATTN_NOTUNE").is_ok() {
-            self.attn_choice.borrow_mut().insert(key, (1, vec));
-            return (1, vec);
+            self.attn_choice.borrow_mut().insert(key, (0, 1, vec, 0.0));
+            return (0, 1, vec, 0.0);
         }
         let foot = |s0: i32, n0: usize, s1: i32, n1: usize, s2: i32, n2: usize, s3: i32, n3: usize| -> usize {
             1 + s0.max(0) as usize * (n0 - 1)
@@ -278,12 +360,17 @@ impl CuteMetal {
             std::ptr::write_bytes(kscratch.contents() as *mut u8, 0, kfoot * 4 * copies);
             std::ptr::write_bytes(vscratch.contents() as *mut u8, 0, vfoot * 4 * copies);
         }
-        let mut best = (f64::INFINITY, (1u32, vec));
+        let mut cands: Vec<(u32, u32, u32)> = Vec::new();
         for split in [1u32, 2, 4, 8] {
-            if split as usize > ctx {
-                continue;
+            if split as usize <= ctx {
+                cands.push((0, split, vec));
             }
-            let pipe = self.attn_pipeline(split, vec);
+        }
+        for (sgs, bk) in crate::atoms::flash_candidates(p) {
+            cands.push((1, sgs, bk));
+        }
+        let mut best = (f64::INFINITY, (0u32, 1u32, vec, 0.0f64));
+        for (kind, x, y) in cands {
             let run = |iters: usize, offs: usize| {
                 let cb = self.queue.new_command_buffer();
                 for it in 0..iters {
@@ -293,7 +380,7 @@ impl CuteMetal {
                     pp[10] = (c * kfoot) as i32;
                     pp[14] = (c * vfoot) as i32;
                     pp[18] = 0;
-                    self.encode_attn(cb, &pipe, &qscratch, &kscratch, &vscratch, &bscratch, &oscratch, &pp, split);
+                    self.encode_attn(cb, kind, x, y, &qscratch, &kscratch, &vscratch, &bscratch, &oscratch, &pp);
                 }
                 cb.commit();
                 cb.wait_until_completed();
@@ -303,13 +390,14 @@ impl CuteMetal {
             run(4, 2);
             let ms = t.elapsed().as_secs_f64() * 1e3 / 4.0;
             if ms < best.0 {
-                best = (ms, (split, vec));
+                best = (ms, (kind, x, y, ms));
             }
         }
+        best.1.3 = best.0;
         if std::env::var("ATTNTUNE").is_ok() {
             eprintln!(
-                "attn tune jobs={jobs} ctx={ctx} hd={hd} vec={vec}: split={} ({:.3} ms)",
-                best.1.0, best.0
+                "attn tune jobs={jobs} ctx={ctx} hd={hd}: kind={} x={} y={} ({:.3} ms)",
+                best.1.0, best.1.1, best.1.2, best.0
             );
         }
         self.attn_choice.borrow_mut().insert(key, best.1);
@@ -357,7 +445,7 @@ impl CuteMetal {
         csplit: u32,
         tg: u64,
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "gemm_sg");
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -413,7 +501,7 @@ impl CuteMetal {
         co: i32,
         tg: u64,
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "gemv_rows");
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -470,7 +558,7 @@ impl CuteMetal {
         ncolg: u32,
         tg: u64,
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "gemv_t");
         enc.set_compute_pipeline_state(pipe);
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -584,6 +672,55 @@ impl CuteMetal {
             );
         }
         self.gemv_choice.borrow_mut().insert(key, best.1);
+    }
+
+    pub fn begin_sampling(&self, cap: u64) {
+        let ts = self
+            .device
+            .counter_sets()
+            .into_iter()
+            .find(|c| c.name() == "timestamp")
+            .expect("timestamp counter set");
+        let desc = metal::CounterSampleBufferDescriptor::new();
+        desc.set_counter_set(&ts);
+        desc.set_sample_count(cap * 2);
+        desc.set_storage_mode(metal::MTLStorageMode::Shared);
+        let buf = self
+            .device
+            .new_counter_sample_buffer_with_descriptor(&desc)
+            .expect("sample buffer");
+        *self.sample_ctx.borrow_mut() = Some(SampleCtx { buf, labels: Vec::new() });
+    }
+
+    pub fn end_sampling(&self) -> Option<SampleCtx> {
+        self.sample_ctx.borrow_mut().take()
+    }
+
+    pub fn enc<'a>(
+        &self,
+        cb: &'a metal::CommandBufferRef,
+        label: &str,
+    ) -> &'a metal::ComputeCommandEncoderRef {
+        let mut ctx = self.sample_ctx.borrow_mut();
+        if let Some(c) = ctx.as_mut() {
+            let i = c.labels.len() as u64;
+            if (i + 1) * 2 <= c.buf.sample_count() {
+                c.labels.push(label.to_string());
+                let desc = metal::ComputePassDescriptor::new();
+                let att = desc.sample_buffer_attachments().object_at(0).unwrap();
+                att.set_sample_buffer(&c.buf);
+                att.set_start_of_encoder_sample_index(i * 2);
+                att.set_end_of_encoder_sample_index(i * 2 + 1);
+                return cb.compute_command_encoder_with_descriptor(&desc);
+            }
+        }
+        cb.new_compute_command_encoder()
+    }
+
+    pub fn sample_timestamps(&self) -> (u64, u64) {
+        let (mut c, mut g) = (0u64, 0u64);
+        self.device.sample_timestamps(&mut c, &mut g);
+        (c, g)
     }
 
     fn pipe(&self, name: &str) -> &ComputePipelineState {
@@ -704,9 +841,9 @@ impl CuteMetal {
             let wbp = [bp[0], 1, bp[2], 0];
             self.encode_gemv_rows(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], tg);
         } else {
-            let choice = self.gemm_choice.borrow().get(&(m, k, n)).copied().flatten();
+            let choice = self.gemm_choice.borrow().get(&(m, k, n, 1)).copied().flatten();
             match choice {
-                Some(v) => self.encode_gemm_sg(cb, v, a, b, c, m, k, n, ap, bp, cp),
+                Some(v) => self.encode_gemm_sg(cb, v, a, b, c, m, k, n, ap, bp, cp, &[0], 1),
                 None => self.matmul_into(cb, a, b, c, m, k, n, ap, bp, cp),
             }
         }
@@ -726,7 +863,7 @@ impl CuteMetal {
         bp: [i32; 4],
         cp: [i32; 4],
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "matmul");
         enc.set_compute_pipeline_state(self.pipe("tiled_matmul"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -745,6 +882,7 @@ impl CuteMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn bmm_into(
         &self,
         cb: &metal::CommandBufferRef,
@@ -760,7 +898,38 @@ impl CuteMetal {
         batch: &[i32],
         nbatch: u64,
     ) {
-        let enc = cb.new_compute_command_encoder();
+        if std::env::var("GENERAL_ONLY").is_err() {
+            let choice = self
+                .gemm_choice
+                .borrow()
+                .get(&(m, k, n, nbatch as i64))
+                .copied()
+                .flatten();
+            if let Some(v) = choice {
+                self.encode_gemm_sg(cb, v, a, b, c, m, k, n, ap, bp, cp, batch, nbatch as i64);
+                return;
+            }
+        }
+        self.bmm_scalar(cb, a, b, c, m, k, n, ap, bp, cp, batch, nbatch);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bmm_scalar(
+        &self,
+        cb: &metal::CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        c: &Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        ap: [i32; 4],
+        bp: [i32; 4],
+        cp: [i32; 4],
+        batch: &[i32],
+        nbatch: u64,
+    ) {
+        let enc = self.enc(cb, "bmm");
         enc.set_compute_pipeline_state(self.pipe("bmm"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -788,7 +957,7 @@ impl CuteMetal {
         cols: usize,
         sp: [i32; 4],
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "ew");
         enc.set_compute_pipeline_state(self.pipe("materialize"));
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), 0);
@@ -810,7 +979,7 @@ impl CuteMetal {
         ext: [u32; 4],
         st: [i32; 4],
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "ew");
         enc.set_compute_pipeline_state(self.pipe("gather3"));
         enc.set_buffer(0, Some(src), 0);
         enc.set_buffer(1, Some(dst), 0);
@@ -824,7 +993,7 @@ impl CuteMetal {
     }
 
     pub fn relu_into(&self, cb: &metal::CommandBufferRef, x: &Buffer, n: usize) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "ew");
         enc.set_compute_pipeline_state(self.pipe("relu"));
         enc.set_buffer(0, Some(x), 0);
         let nu = n as u32;
@@ -844,7 +1013,7 @@ impl CuteMetal {
         cols: usize,
         bp: [i32; 4],
     ) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "ew");
         enc.set_compute_pipeline_state(self.pipe("add2"));
         enc.set_buffer(0, Some(a), 0);
         enc.set_buffer(1, Some(b), 0);
@@ -860,7 +1029,7 @@ impl CuteMetal {
     }
 
     pub fn softmax_into(&self, cb: &metal::CommandBufferRef, x: &Buffer, rows: usize, cols: usize) {
-        let enc = cb.new_compute_command_encoder();
+        let enc = self.enc(cb, "ew");
         enc.set_compute_pipeline_state(self.pipe("softmax_rows"));
         enc.set_buffer(0, Some(x), 0);
         let (r, co) = (rows as u32, cols as u32);

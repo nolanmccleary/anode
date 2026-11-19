@@ -59,7 +59,7 @@ pub fn mma_plan(
     Some(MmaPlan { a_trans, b_trans })
 }
 
-pub fn mma_candidates(m: usize, n: usize) -> Vec<(u32, u32, u32, u32)> {
+pub fn mma_candidates(m: usize, n: usize, k: usize) -> Vec<(u32, u32, u32, u32, u32)> {
     let mut v = Vec::new();
     for (sgm, sgn) in [(1u32, 1u32), (2, 1), (2, 2), (4, 2)] {
         for (atm, atn) in [(2u32, 2u32), (4, 2), (2, 4), (4, 4)] {
@@ -71,7 +71,41 @@ pub fn mma_candidates(m: usize, n: usize) -> Vec<(u32, u32, u32, u32)> {
             if m % bm != 0 || n % bn != 0 {
                 continue;
             }
-            v.push((sgm, sgn, atm, atn));
+            v.push((sgm, sgn, atm, atn, 0));
+            if k % 16 == 0 {
+                v.push((sgm, sgn, atm, atn, 1));
+            }
+        }
+    }
+    v
+}
+
+pub const FLASH_Q_ROWS: i64 = 8;
+
+pub fn flash_candidates(p: &[i32; 25]) -> Vec<(u32, u32)> {
+    let (s, ctx, hd) = (p[2] as usize, p[3] as usize, p[4] as i64);
+    let geometry_ok = hd % FLASH_Q_ROWS == 0
+        && hd <= 64
+        && s >= FLASH_Q_ROWS as usize
+        && p[9] == 1
+        && p[13] == 1
+        && p[17] == 1
+        && p[8] >= 1
+        && p[12] >= 1
+        && p[16] >= 1;
+    if !geometry_ok {
+        return Vec::new();
+    }
+    let mut v = Vec::new();
+    for sgs in [2u32, 4, 8] {
+        if s % (FLASH_Q_ROWS as usize * sgs as usize) != 0 {
+            continue;
+        }
+        for bk in [16u32, 32] {
+            if ctx % bk as usize != 0 {
+                continue;
+            }
+            v.push((sgs, bk));
         }
     }
     v
