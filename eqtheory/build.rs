@@ -10,7 +10,7 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name != "cute-layout" && name != "target" {
+            if name != "target" {
                 rs_files(&path, out);
             }
         } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
@@ -24,9 +24,11 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/onnx.proto");
     prost_build::compile_protos(&["proto/onnx.proto"], &["proto"]).expect("compile onnx.proto");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=bin");
     println!("cargo:rerun-if-changed=tests");
     let mut files = Vec::new();
     rs_files(Path::new("src"), &mut files);
+    rs_files(Path::new("bin"), &mut files);
     rs_files(Path::new("tests"), &mut files);
     for f in &files {
         println!("cargo:rerun-if-changed={}", f.display());
@@ -89,17 +91,19 @@ fn main() {
         );
     }
 
-    for f in fs::read_dir("src").unwrap() {
-        let path = f.unwrap().path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        let text = fs::read_to_string(&path).unwrap_or_default();
-        if text.to_lowercase().contains("luminal") {
-            panic!(
-                "  [verticalized] {} mentions `luminal` — src/ is the system, derived entirely from the CuTe axioms; comparison code that consumes Luminal lives only in baseline/",
-                path.display()
-            );
+    for dir in ["src", "bin"] {
+        for f in fs::read_dir(dir).unwrap() {
+            let path = f.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            if text.to_lowercase().contains("luminal") {
+                panic!(
+                    "  [verticalized] {} mentions `luminal` — src/ and bin/ are the system, derived entirely from the CuTe axioms; comparison code that consumes Luminal lives only in harness/luminal/",
+                    path.display()
+                );
+            }
         }
     }
 

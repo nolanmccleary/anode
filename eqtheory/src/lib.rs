@@ -11,4 +11,3 @@ pub mod onnx_import;
 pub mod session_run;
 pub mod native_fuse;
 pub mod native_model;
-pub mod views;

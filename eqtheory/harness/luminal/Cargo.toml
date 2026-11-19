@@ -1,0 +1,23 @@
+[package]
+name = "eqtheory-baseline"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eqtheory = { path = "../.." }
+cute-layout = { path = "../../../refs/cuda-rust/cuda-oxide/cute-rs-preview/cute-layout" }
+egglog = { git = "https://github.com/egraphs-good/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
+luminal = { path = "../../../refs/luminal", features = ["cute"] }
+luminal_metal = { path = "../../../refs/luminal/crates/luminal_metal", features = ["cute"] }
+model_zoo = { path = "../../../refs/luminal/crates/model_zoo" }
+metal = { version = "0.31", features = ["mps"] }
+anyhow = "1"
+objc = "0.2"
+
+[[bin]]
+name = "run_luminal"
+path = "src/run_luminal.rs"
+
+[[bin]]
+name = "export_model"
+path = "src/export_model.rs"

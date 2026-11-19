@@ -1,4 +1,4 @@
 target/
 .venv/
 models/
-tests/
+results/

@@ -8,4 +8,8 @@ name = "cute"
 crate-type = ["cdylib"]
 
 [dependencies]
-eqtheory = { path = ".." }
+eqtheory = { path = "../.." }
+
+[[bin]]
+name = "cutedriver"
+path = "src/driver.rs"

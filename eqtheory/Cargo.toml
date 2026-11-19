@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "baseline", "ffi", "burnrun"]
+members = [".", "harness/luminal", "harness/cute", "harness/burn"]
 
 [package]
 name = "eqtheory"
@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-cute-layout = { path = "cute-layout" }
+cute-layout = { path = "../refs/cuda-rust/cuda-oxide/cute-rs-preview/cute-layout" }
 egglog = { git = "https://github.com/egraphs-good/egglog", rev = "3787810fa259efc45237eecd98d7914a6b02256c" }
 metal = { version = "0.31", features = ["mps"] }
 objc = "0.2"
@@ -19,56 +19,52 @@ prost-build = "0.13"
 
 [[bin]]
 name = "compression"
-path = "src/compression.rs"
+path = "bin/compression.rs"
 
 [[bin]]
 name = "egraph"
-path = "src/egraph.rs"
+path = "bin/egraph.rs"
 
 [[bin]]
 name = "cutematch"
-path = "src/cutematch.rs"
+path = "bin/cutematch.rs"
 
 [[bin]]
 name = "cutesat"
-path = "src/cutesat.rs"
+path = "bin/cutesat.rs"
 
 [[bin]]
 name = "cuteextract"
-path = "src/cuteextract.rs"
+path = "bin/cuteextract.rs"
 
 [[bin]]
 name = "tmbench"
-path = "src/tmbench.rs"
+path = "bin/tmbench.rs"
 
 [[bin]]
 name = "gemvbench"
-path = "src/gemvbench.rs"
+path = "bin/gemvbench.rs"
 
 [[bin]]
 name = "nativerun"
-path = "src/nativerun.rs"
+path = "bin/nativerun.rs"
 
 [[bin]]
 name = "session"
-path = "src/session.rs"
+path = "bin/session.rs"
 
 [[bin]]
 name = "onnxdump"
-path = "src/onnxdump.rs"
+path = "bin/onnxdump.rs"
 
 [[bin]]
 name = "onnxcheck"
-path = "src/onnxcheck.rs"
+path = "bin/onnxcheck.rs"
 
 [[bin]]
 name = "onnxsession"
-path = "src/onnxsession.rs"
-
-[[bin]]
-name = "cutedriver"
-path = "src/cutedriver.rs"
+path = "bin/onnxsession.rs"
 
 [[bin]]
 name = "decodediff"
-path = "src/decodediff.rs"
+path = "bin/decodediff.rs"

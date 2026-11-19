@@ -8,7 +8,7 @@ import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = os.path.join(ROOT, ".venv/bin/python")
-BENCH = os.path.join(ROOT, "bench")
+BENCH = os.path.join(ROOT, "harness")
 
 P, G, C = 512, 64, 640
 REPEATS = 3
@@ -121,7 +121,7 @@ def _chart(results, out_dir):
 def main():
     onnx = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "models/fat/model.onnx")
     ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = os.path.join(ROOT, "tests", f"profile_test_{ts}")
+    out_dir = os.path.join(ROOT, "results", f"profile_test_{ts}")
     os.makedirs(out_dir, exist_ok=True)
     results = [
         run_cute_test(onnx, out_dir),

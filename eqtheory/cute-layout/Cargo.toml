@@ -1,8 +1,0 @@
-[package]
-name = "cute-layout"
-version = "0.3.0"
-edition = "2024"
-description = "Vendored CuTe-style layout algebra (from cuda-oxide/cute-rs-preview) for the luminal-cute experiment"
-license = "Apache-2.0"
-
-[dependencies]

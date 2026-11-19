@@ -39,7 +39,7 @@ reaches a fixpoint at all.
 
 ## The solution: CuTe composition is closed and compresses
 
-CuTe's layout algebra (`cute-layout`, vendored here) provides layout identities
+CuTe's layout algebra (`cute-layout`, from `refs/cuda-rust/cuda-oxide/cute-rs-preview`) provides layout identities
 Luminal has no rule for:
 
 - `composition(A, B) = C`: layout composition is closed; `A∘B` is another compact
@@ -52,7 +52,7 @@ Under this theory the composition of an arbitrarily deep view chain stays a
 bounded, canonical layout. The blowup Luminal guards against is definitionally
 absent, because the theory is closed under composition and `coalesce` canonicalizes.
 
-## Evidence (`src/compression.rs`)
+## Evidence (`bin/compression.rs`)
 
 A ViT-style flatten/transpose view chain over N=4096, measured in the e-graph's
 own currency (term size):
@@ -82,7 +82,7 @@ The ruleset is a **compile option** so the two theories can be deltaed cleanly:
 run identical input under `Affine` (no CuTe rules) versus `Cute` (CuTe rules) and
 compare the resulting e-graph.
 
-## Harness (`src/egraph.rs`)
+## Harness (`bin/egraph.rs`)
 
 CuTe layouts are egglog terms (`CLayout`, `Modes`), run on the same egglog fork
 Luminal uses, so the rules port into the core. A `Ruleset` enum selects the
@@ -184,8 +184,8 @@ measurement that justifies that swap.
 
 ## Methodology constraints
 
-- Project code carries no comments. `tests/no_comments.rs` enforces this over
-  `src/` and `tests/`; the vendored `cute-layout/` is excluded (it is not our code).
+- Project code carries no comments. `build.rs` enforces this over
+  `src/` and `tests/`; `cute-layout` (in `refs/`) is excluded (it is not our code).
 - Experiments report e-graph quantities (term size, reachability, saturation),
   not kernel timings.
 - Every equivalence a rule asserts must be numerically verified against the
