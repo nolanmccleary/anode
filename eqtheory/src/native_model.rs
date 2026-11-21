@@ -1,4 +1,4 @@
-use crate::ir::{identity, layout_of, rm_strides, Dt, GraphIr, Nl, Read, Tensor};
+use crate::ir::{layout_of, rm_strides, Dt, GraphIr, Nl, Read, Tensor};
 
 pub struct NativeCfg {
     pub vocab: i64,
@@ -109,8 +109,9 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         probes.push((format!("keys.{l}"), keys.id));
 
         let sh = vec![kv, grp, s, ctx, hd];
-        let qr = Read { src: q.id, layout: layout_of(&sh, &[grp * hd, hd, d, 0, 1]) };
-        let kr = Read { src: keys.id, layout: layout_of(&sh, &[hd, 0, 0, kvd, 1]) };
+        let qr = Read { src: q.id, layout: layout_of(&sh, &[grp * hd, hd, d, 0, 1]), base: 0 };
+
+        let kr = Read { src: keys.id, layout: layout_of(&sh, &[hd, 0, 0, kvd, 1]), base: 0 };
         let scores_raw = g.movn(vec![kv, grp, s, ctx], qr, Some(kr), hd, true);
         probes.push((format!("scores.{l}"), scores_raw.id));
         let scores = g.scale(scores_raw, scale);
@@ -119,9 +120,9 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         let sa = {
             let mut st = rm_strides(&[kv, grp, s, ctx]);
             st.push(0);
-            Read { src: scores.id, layout: layout_of(&msh, &st) }
+            Read { src: scores.id, layout: layout_of(&msh, &st), base: 0 }
         };
-        let sb = Read { src: mask_t.id, layout: layout_of(&msh, &[0, 0, ctx, 1, 0]) };
+        let sb = Read { src: mask_t.id, layout: layout_of(&msh, &[0, 0, ctx, 1, 0]), base: 0 };
         let biased = g.movn(vec![kv, grp, s, ctx], sa, Some(sb), 2, false);
 
         let scaled = g.scale(biased, LOG2E);
@@ -134,14 +135,15 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
         let pr = Read {
             src: probs.id,
             layout: layout_of(&psh, &[grp * s * ctx, s * ctx, ctx, 0, 1]),
+            base: 0,
         };
-        let vr = Read { src: vals.id, layout: layout_of(&psh, &[hd, 0, 0, 1, kvd]) };
+        let vr = Read { src: vals.id, layout: layout_of(&psh, &[hd, 0, 0, 1, kvd]), base: 0 };
         let attn_h = g.movn(vec![kv, grp, s, hd], pr, Some(vr), ctx, true);
         probes.push((format!("attn_h.{l}"), attn_h.id));
 
         let flat = vec![s, d];
         let attn = if s == 1 {
-            g.movn(flat.clone(), Read { src: attn_h.id, layout: layout_of(&[1, d, 1], &[0, 1, 0]) }, None, 1, true)
+            g.movn(flat.clone(), Read { src: attn_h.id, layout: layout_of(&[1, d, 1], &[0, 1, 0]), base: 0 }, None, 1, true)
         } else {
             let perm = Read {
                 src: attn_h.id,
@@ -149,6 +151,7 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
                     &[s, kv, grp, hd, 1],
                     &[hd, grp * s * hd, s * hd, 1, 0],
                 ),
+                base: 0,
             };
             g.movn(flat.clone(), perm, None, 1, true)
         };
@@ -171,8 +174,8 @@ pub fn build(cfg: &NativeCfg, gather_vals: Vec<i32>) -> NativeModel {
 
     let fx = rms_norm(&mut g, x, d, eps);
     let lsh = vec![s, cfg.vocab, d];
-    let fr = Read { src: fx.id, layout: layout_of(&lsh, &[d, 0, 1]) };
-    let er = Read { src: embed.id, layout: layout_of(&lsh, &[0, d, 1]) };
+    let fr = Read { src: fx.id, layout: layout_of(&lsh, &[d, 0, 1]), base: 0 };
+    let er = Read { src: embed.id, layout: layout_of(&lsh, &[0, d, 1]), base: 0 };
     let logits = g.movn(vec![s, cfg.vocab], fr, Some(er), d, true);
 
     NativeModel {

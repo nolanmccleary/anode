@@ -68,3 +68,31 @@ path = "bin/onnxsession.rs"
 [[bin]]
 name = "decodediff"
 path = "bin/decodediff.rs"
+
+[[bin]]
+name = "distribute"
+path = "bin/distribute.rs"
+
+[[bin]]
+name = "stabilize"
+path = "bin/stabilize.rs"
+
+[[bin]]
+name = "mapgraph"
+path = "bin/mapgraph.rs"
+
+[[bin]]
+name = "derive"
+path = "bin/derive.rs"
+
+[[bin]]
+name = "merge"
+path = "bin/merge.rs"
+
+[[bin]]
+name = "extract"
+path = "bin/extract.rs"
+
+[[bin]]
+name = "cogroup"
+path = "bin/cogroup.rs"

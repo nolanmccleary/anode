@@ -58,6 +58,7 @@ enum Tape {
     Run1d {
         kernel: &'static str,
         bufs: Vec<Buffer>,
+        offsets: Vec<u64>,
         metas: Vec<(u64, [i32; 18])>,
         scalars: Vec<(u64, u32)>,
         specs: Vec<(u64, [i32; 8])>,
@@ -203,7 +204,7 @@ fn resolve_read(g: &GraphIr, hazard: &std::collections::HashSet<usize>, r: &Read
         if bsh != csh {
             break;
         }
-        cur = Read { src: a.src, layout: comp };
+        cur = Read { src: a.src, layout: comp, base: 0 };
     }
     cur
 }
@@ -303,7 +304,7 @@ impl NativeExec {
         let out = self.alloc(n as usize * 4);
         let sb = self.use_buf(a.src);
         self.guard_write_overlap(id, &out, &[&sb]);
-        self.xcopy(sb, out.clone(), vec![], n, meta, flat_meta(n), [0; 8], [0; 8]);
+        self.xcopy(sb, out.clone(), vec![], n, meta, flat_meta(n), [0; 8], [0; 8], 0);
         self.bufs[id] = Some(out);
     }
 
@@ -349,7 +350,21 @@ impl NativeExec {
         specs: Vec<(u64, [i32; 8])>,
         n: u64,
     ) {
-        self.tape.push(Tape::Run1d { kernel, bufs, metas, scalars, specs, progs: Vec::new(), n });
+        self.tape.push(Tape::Run1d { kernel, bufs, offsets: Vec::new(), metas, scalars, specs, progs: Vec::new(), n });
+        self.dispatches += 1;
+    }
+
+    fn push1d_off(
+        &mut self,
+        kernel: &'static str,
+        bufs: Vec<Buffer>,
+        offsets: Vec<u64>,
+        metas: Vec<(u64, [i32; 18])>,
+        scalars: Vec<(u64, u32)>,
+        specs: Vec<(u64, [i32; 8])>,
+        n: u64,
+    ) {
+        self.tape.push(Tape::Run1d { kernel, bufs, offsets, metas, scalars, specs, progs: Vec::new(), n });
         self.dispatches += 1;
     }
 
@@ -363,20 +378,29 @@ impl NativeExec {
         wmeta: [i32; 18],
         rspec: [i32; 8],
         wspec: [i32; 8],
+        src_base: i64,
     ) {
         let d = |k: usize, idx: &Vec<(Buffer, [i32; 18])>| {
             idx.get(k).map(|(b, _)| b.clone()).unwrap_or_else(|| src.clone())
         };
         let (i0, i1, i2, i3) = (d(0, &idx), d(1, &idx), d(2, &idx), d(3, &idx));
         let im = |k: usize| idx.get(k).map(|(_, m)| *m).unwrap_or([0i32; 18]);
-        self.push1d(
-            "xcopy_f",
-            vec![src, dst, i0, i1, i2, i3],
-            vec![(7, rmeta), (8, wmeta), (11, im(0)), (12, im(1)), (13, im(2)), (14, im(3))],
-            vec![(6, n as u32)],
-            vec![(9, rspec), (10, wspec)],
-            n as u64,
-        );
+        let metas = vec![(7, rmeta), (8, wmeta), (11, im(0)), (12, im(1)), (13, im(2)), (14, im(3))];
+        let scalars = vec![(6, n as u32)];
+        let specs = vec![(9, rspec), (10, wspec)];
+        if src_base != 0 {
+            self.push1d_off(
+                "xcopy_f",
+                vec![src, dst, i0, i1, i2, i3],
+                vec![(src_base * 4) as u64, 0, 0, 0, 0, 0],
+                metas,
+                scalars,
+                specs,
+                n as u64,
+            );
+        } else {
+            self.push1d("xcopy_f", vec![src, dst, i0, i1, i2, i3], metas, scalars, specs, n as u64);
+        }
     }
 
     pub fn build(&mut self, g: &GraphIr, inputs: &std::collections::HashMap<String, Vec<f32>>) {
@@ -731,6 +755,7 @@ impl NativeExec {
         self.tape.push(Tape::Run1d {
             kernel: "attn_online",
             bufs: vec![qbuf, kbuf, vbuf, mbuf, out.clone()],
+            offsets: Vec::new(),
             metas: vec![],
             scalars: vec![],
             specs: vec![],
@@ -794,7 +819,7 @@ impl NativeExec {
             reads.extend(ibufs.iter().map(|(b, _)| b));
             self.guard_write_overlap(id, &out, &reads);
         }
-        self.xcopy(sb, out.clone(), ibufs, n, rmeta, flat_meta(n), rspec, [0; 8]);
+        self.xcopy(sb, out.clone(), ibufs, n, rmeta, flat_meta(n), rspec, [0; 8], a.base);
         self.bufs[id] = Some(out);
     }
 
@@ -816,11 +841,11 @@ impl NativeExec {
         };
         if !alias {
             let bb = self.use_buf(base);
-            self.xcopy(bb, out.clone(), vec![], n, flat_meta(n), flat_meta(n), [0; 8], [0; 8]);
+            self.xcopy(bb, out.clone(), vec![], n, flat_meta(n), flat_meta(n), [0; 8], [0; 8], 0);
         }
-        let src_n = numel(&g.nodes[a.src].dims);
         let rmeta = meta_of(&a.layout).expect("scatter rmeta");
         let (wsh, _) = axes_of(&a.layout);
+        let src_n: i64 = wsh.iter().product();
         let mut wst = vec![0i64; wsh.len()];
         if wsh.len() >= 2 {
             wst[wsh.len() - 2] = 1;
@@ -840,7 +865,7 @@ impl NativeExec {
             reads.extend(ibufs.iter().map(|(b, _)| b));
             self.guard_write_overlap(id, &out, &reads);
         }
-        self.xcopy(sb, out.clone(), ibufs, src_n, rmeta, wmeta, [0; 8], wspec);
+        self.xcopy(sb, out.clone(), ibufs, src_n, rmeta, wmeta, [0; 8], wspec, a.base);
         self.bufs[id] = Some(out);
     }
 
@@ -897,7 +922,7 @@ impl NativeExec {
         let cb = self.backend.owned_command_buffer();
         for t in &self.tape {
             match t {
-                Tape::Run1d { kernel, bufs, metas, scalars, specs, progs, n } => {
+                Tape::Run1d { kernel, bufs, offsets, metas, scalars, specs, progs, n } => {
                     let enc = self.backend.enc(&cb, kernel);
                     let mut tg_override = None;
                     if *kernel == "attn_online" {
@@ -916,7 +941,7 @@ impl NativeExec {
                         enc.set_compute_pipeline_state(self.backend.pipeline(kernel));
                     }
                     for (k, b) in bufs.iter().enumerate() {
-                        enc.set_buffer(k as u64, Some(b), 0);
+                        enc.set_buffer(k as u64, Some(b), offsets.get(k).copied().unwrap_or(0));
                     }
                     for (slot, m) in metas {
                         enc.set_bytes(*slot, 72, m.as_ptr() as *const _);

@@ -91,6 +91,38 @@ fn main() {
         );
     }
 
+    let banned = ["cute", "wire"].concat();
+    let mut banned_hits: Vec<String> = Vec::new();
+    let mut stack = vec![PathBuf::from(".")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if path.is_dir() {
+                if name != "target" && name != ".git" {
+                    stack.push(path);
+                }
+                continue;
+            }
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            if !["rs", "toml", "md", "py", "txt", "lock"].contains(&ext) {
+                continue;
+            }
+            if let Ok(text) = fs::read_to_string(&path) {
+                if text.contains(&banned) || name.contains(&banned) {
+                    banned_hits.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    if !banned_hits.is_empty() {
+        panic!(
+            "  [no-{banned}] the token `{banned}` is banned repo-wide and must never reappear — found in:\n    {}",
+            banned_hits.join("\n    ")
+        );
+    }
+
     for dir in ["src", "bin"] {
         for f in fs::read_dir(dir).unwrap() {
             let path = f.unwrap().path();
@@ -123,11 +155,47 @@ fn main() {
         }
     }
 
+    // === universal-egraph-rules (RULES.md) ===
+    // The e-graph may carry ONLY mathematically universal laws: CuTe layout
+    // identities (composition, coalesce, tiling via zipped_divide, complement,
+    // products) and the fixed semiring laws (distributivity, associativity,
+    // commutativity). A fused kernel must EMERGE as a cost-ranked extraction
+    // over that universal e-graph, never as a bespoke merge rule. Every
+    // datatype/relation/function/sort an egglog program declares must name a
+    // universal term; implementation-named fusions (rms/silu/attn/qkv/merge/…)
+    // are banned. Add a term here ONLY with the universal law it instantiates.
+    let universal_egraph_decls = [
+        "LT",       // layout term datatype (CLit/Compose) — CuTe composition+coalesce
+        "Data",     // a layout under decomposition
+        "Spec",     // a tiling spec — zipped_divide, a CuTe layout law
+        "Serviced", // result of applying cute-tile-mode (zipped_divide)
+        "Val",      // tensor-value term (In/Contract/Concat/Slice) — the fixed (+,x)
+                    // contraction + generic concat/slice; carries distributivity &
+                    // reduction-reassociation, both universal semiring laws
+    ];
+    let egraph_decls = ["(relation ", "(datatype ", "(function ", "(sort "];
+
     let mut bad: Vec<String> = Vec::new();
     for f in &files {
         let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let text = fs::read_to_string(f).unwrap();
         let at = |rule: &str| format!("  [{rule}] {}", f.display());
+
+        for decl in egraph_decls {
+            for (i, _) in text.match_indices(decl) {
+                let rest = &text[i + decl.len()..];
+                let term: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !term.is_empty() && !universal_egraph_decls.contains(&term.as_str()) {
+                    bad.push(format!(
+                        "{} (declares e-graph term `{term}` — only mathematically universal CuTe/semiring laws may live in the e-graph; special-implementation fusion rules must EMERGE from cost-ranked extraction, not be hand-coded)",
+                        at("universal-egraph-rules")
+                    ));
+                }
+            }
+        }
 
         if text.contains(&line_comment) || text.contains(&block_comment) {
             bad.push(at("no-comments"));

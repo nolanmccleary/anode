@@ -1,6 +1,7 @@
 pub mod atoms;
 pub mod cpu_ref;
 pub mod cute_egraph;
+pub mod cute_fuse;
 pub mod cute_match;
 pub mod ir;
 pub mod kernels;

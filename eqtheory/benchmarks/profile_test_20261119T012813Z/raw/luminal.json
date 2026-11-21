@@ -1,0 +1,13 @@
+{
+  "name": "luminal",
+  "platform": "metal",
+  "ttft_ms": 603.469,
+  "decode_tok_s": 58.104,
+  "e2e_ms": 1740.995,
+  "logits_file": "luminal_logits.bin",
+  "available": true,
+  "ttft_ms_best": 587.821,
+  "decode_tok_s_best": 61.233,
+  "e2e_ms_best": 1633.016,
+  "logit_check": "pass"
+}

@@ -1,0 +1,15 @@
+{
+  "name": "cute",
+  "ttft_ms": 198.054,
+  "decode_tok_s": 117.57,
+  "e2e_ms": 742.41,
+  "prefill_dispatches": 147,
+  "decode_dispatches": 123,
+  "platform": "metal",
+  "logits_file": "cute_logits.bin",
+  "available": true,
+  "ttft_ms_best": 186.69,
+  "decode_tok_s_best": 141.948,
+  "e2e_ms_best": 637.561,
+  "logit_check": "pass"
+}

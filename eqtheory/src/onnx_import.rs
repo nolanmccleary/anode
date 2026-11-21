@@ -81,7 +81,7 @@ impl<'a> Lowerer<'a> {
         if contiguous(h) {
             return h.clone();
         }
-        let r = Read { src: h.node, layout: layout_of(&h.shape, &h.strides) };
+        let r = Read { src: h.node, layout: layout_of(&h.shape, &h.strides), base: 0 };
         let t = self.g.movn(h.shape.clone(), r, None, 1, true);
         Handle { node: t.id, shape: h.shape.clone(), strides: rm_strides(&h.shape) }
     }
@@ -92,7 +92,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn read(&self, h: &Handle) -> Read {
-        Read { src: h.node, layout: layout_of(&h.shape, &h.strides) }
+        Read { src: h.node, layout: layout_of(&h.shape, &h.strides), base: 0 }
     }
 
     fn get(&self, name: &str) -> Handle {
@@ -134,8 +134,8 @@ impl<'a> Lowerer<'a> {
         b_str.push(b.strides[rb - 2]);
         let mut rshape = oshape.clone();
         rshape.push(ka);
-        let ra_read = Read { src: a.node, layout: layout_of(&rshape, &a_str) };
-        let rb_read = Read { src: b.node, layout: layout_of(&rshape, &b_str) };
+        let ra_read = Read { src: a.node, layout: layout_of(&rshape, &a_str), base: 0 };
+        let rb_read = Read { src: b.node, layout: layout_of(&rshape, &b_str), base: 0 };
         let t = self.g.movn(oshape.clone(), ra_read, Some(rb_read), ka, true);
         self.fresh(t)
     }
@@ -155,8 +155,8 @@ impl<'a> Lowerer<'a> {
             b_str[i] = if bd == 1 { 0 } else { bst };
         }
         if pair {
-            let ra = Read { src: a.node, layout: layout_of(&oshape, &a_str) };
-            let rb = Read { src: b.node, layout: layout_of(&oshape, &b_str) };
+            let ra = Read { src: a.node, layout: layout_of(&oshape, &a_str), base: 0 };
+            let rb = Read { src: b.node, layout: layout_of(&oshape, &b_str), base: 0 };
             let t = self.g.movn(oshape.clone(), ra, Some(rb), 1, true);
             return self.fresh(t);
         }
@@ -164,8 +164,8 @@ impl<'a> Lowerer<'a> {
         sshape.push(2);
         a_str.push(0);
         b_str.push(0);
-        let ra = Read { src: a.node, layout: layout_of(&sshape, &a_str) };
-        let rb = Read { src: b.node, layout: layout_of(&sshape, &b_str) };
+        let ra = Read { src: a.node, layout: layout_of(&sshape, &a_str), base: 0 };
+        let rb = Read { src: b.node, layout: layout_of(&sshape, &b_str), base: 0 };
         let t = self.g.movn(oshape.clone(), ra, Some(rb), 2, false);
         self.fresh(t)
     }

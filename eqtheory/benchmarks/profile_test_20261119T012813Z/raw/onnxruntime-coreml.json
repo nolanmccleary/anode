@@ -1,0 +1,13 @@
+{
+  "name": "onnxruntime-coreml",
+  "platform": "coreml",
+  "ttft_ms": 501.54133400064893,
+  "decode_tok_s": 43.474278690654735,
+  "e2e_ms": 2018.9342090015998,
+  "logits_file": "ort_coreml_logits.bin",
+  "available": true,
+  "ttft_ms_best": 477.56687499895634,
+  "decode_tok_s_best": 44.646496972196445,
+  "e2e_ms_best": 1911.049999998795,
+  "logit_check": "pass"
+}

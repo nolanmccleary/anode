@@ -1,0 +1,13 @@
+{
+  "name": "mlx",
+  "platform": "metal",
+  "ttft_ms": 65.17816700034018,
+  "decode_tok_s": 147.9507233196199,
+  "e2e_ms": 497.96816799971566,
+  "logits_file": "mlx_logits.bin",
+  "available": true,
+  "ttft_ms_best": 65.16512499911187,
+  "decode_tok_s_best": 148.02821787933013,
+  "e2e_ms_best": 497.5281669994729,
+  "logit_check": "pass"
+}

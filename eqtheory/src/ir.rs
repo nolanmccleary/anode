@@ -23,6 +23,16 @@ pub enum Dt {
 pub struct Read {
     pub src: NodeId,
     pub layout: Layout,
+    pub base: i64,
+}
+
+impl Read {
+    pub fn new(src: NodeId, layout: Layout) -> Self {
+        Read { src, layout, base: 0 }
+    }
+    pub fn at(src: NodeId, layout: Layout, base: i64) -> Self {
+        Read { src, layout, base }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -112,7 +122,7 @@ impl GraphIr {
 
     pub fn pointwise(&mut self, nl: Nl, x: Tensor) -> Tensor {
         let dims = self.dims(x);
-        let read = Read { src: x.id, layout: identity(&dims) };
+        let read = Read { src: x.id, layout: identity(&dims), base: 0 };
         self.push(NodeKind::Pointwise { nl, read }, dims, Dt::F32)
     }
 
@@ -138,8 +148,8 @@ impl GraphIr {
         st.push(0);
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &st) };
-        let rb = Read { src: b.id, layout: layout_of(&sh, &st) };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &st), base: 0 };
+        let rb = Read { src: b.id, layout: layout_of(&sh, &st), base: 0 };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -154,8 +164,8 @@ impl GraphIr {
         sb.push(0);
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa) };
-        let rb = Read { src: row.id, layout: layout_of(&sh, &sb) };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
+        let rb = Read { src: row.id, layout: layout_of(&sh, &sb), base: 0 };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -170,8 +180,8 @@ impl GraphIr {
         sb.push(0);
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa) };
-        let rb = Read { src: b.id, layout: layout_of(&sh, &sb) };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
+        let rb = Read { src: b.id, layout: layout_of(&sh, &sb), base: 0 };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -184,8 +194,8 @@ impl GraphIr {
         sb[dims.len()] = 0;
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa) };
-        let rb = Read { src: k.id, layout: layout_of(&sh, &sb) };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
+        let rb = Read { src: k.id, layout: layout_of(&sh, &sb), base: 0 };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -196,8 +206,8 @@ impl GraphIr {
         sh.push(2);
         let mut st = rm_strides(&dims);
         st.push(0);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &st) };
-        let rb = Read { src: b.id, layout: layout_of(&sh, &st) };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &st), base: 0 };
+        let rb = Read { src: b.id, layout: layout_of(&sh, &st), base: 0 };
         self.movn(dims, ra, Some(rb), 2, false)
     }
 
@@ -209,8 +219,8 @@ impl GraphIr {
         sa.push(0);
         let mut sb = vec![0i64; dims.len() + 1];
         sb[dims.len()] = 0;
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa) };
-        let rb = Read { src: s.id, layout: layout_of(&sh, &sb) };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
+        let rb = Read { src: s.id, layout: layout_of(&sh, &sb), base: 0 };
         self.movn(dims, ra, Some(rb), 2, false)
     }
 
@@ -219,7 +229,7 @@ impl GraphIr {
         let (out, k) = dims.split_at(dims.len() - 1);
         let kext = k[0];
         let st = rm_strides(&dims);
-        let ra = Read { src: a.id, layout: layout_of(&dims, &st) };
+        let ra = Read { src: a.id, layout: layout_of(&dims, &st), base: 0 };
         self.movn(out.to_vec(), ra, None, kext, true)
     }
 
@@ -230,8 +240,8 @@ impl GraphIr {
         assert_eq!(wd[0], k, "matmul inner");
         let n = wd[1];
         let sh = vec![m, n, k];
-        let ra = Read { src: x.id, layout: layout_of(&sh, &[k, 0, 1]) };
-        let rb = Read { src: w.id, layout: layout_of(&sh, &[0, 1, n]) };
+        let ra = Read { src: x.id, layout: layout_of(&sh, &[k, 0, 1]), base: 0 };
+        let rb = Read { src: w.id, layout: layout_of(&sh, &[0, 1, n]), base: 0 };
         self.movn(vec![m, n], ra, Some(rb), k, true)
     }
 
@@ -241,7 +251,7 @@ impl GraphIr {
         let dims = vec![out_rows, width];
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: table.id, layout: layout_of(&sh, &[0, 1, 0]) };
+        let ra = Read { src: table.id, layout: layout_of(&sh, &[0, 1, 0]), base: 0 };
         let ir = IdxRead {
             idx: idx.id,
             idx_layout: layout_of(&sh, &[1, 0, 0]),
@@ -269,7 +279,28 @@ impl GraphIr {
         assert_eq!(rd[1], width, "scatter width");
         let mut sh = rd.clone();
         sh.push(1);
-        let ra = Read { src: rows.id, layout: layout_of(&sh, &[width, 1, 0]) };
+        let ra = Read { src: rows.id, layout: layout_of(&sh, &[width, 1, 0]), base: 0 };
+        self.scatter_impl(base, idx, ra, width)
+    }
+
+    pub fn scatter_rows_sliced(
+        &mut self,
+        base: Tensor,
+        idx: Tensor,
+        src: Tensor,
+        col_base: i64,
+        row_stride: i64,
+        rows: i64,
+    ) -> Tensor {
+        let width = self.dims(base)[1];
+        let sh = vec![rows, width, 1];
+        let ra = Read::at(src.id, layout_of(&sh, &[row_stride, 1, 0]), col_base);
+        self.scatter_impl(base, idx, ra, width)
+    }
+
+    fn scatter_impl(&mut self, base: Tensor, idx: Tensor, ra: Read, width: i64) -> Tensor {
+        let bd = self.dims(base);
+        let sh = vec![self.nodes[ra.src].dims.first().copied().unwrap_or(1), width, 1];
         let wi = IdxRead {
             idx: idx.id,
             idx_layout: layout_of(&sh, &[1, 0, 0]),
