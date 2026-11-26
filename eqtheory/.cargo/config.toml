@@ -1,0 +1,2 @@
+[build]
+rustflags = ["-C", "link-arg=-Wl,-rpath,/Users/nolan/projects/anode/eqtheory/.venv/lib/python3.11/site-packages/mlx/lib"]

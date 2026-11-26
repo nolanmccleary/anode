@@ -24,14 +24,18 @@ pub struct Read {
     pub src: NodeId,
     pub layout: Layout,
     pub base: i64,
+    pub nls: Vec<Nl>,
 }
 
 impl Read {
     pub fn new(src: NodeId, layout: Layout) -> Self {
-        Read { src, layout, base: 0 }
+        Read { src, layout, base: 0, nls: Vec::new() }
     }
     pub fn at(src: NodeId, layout: Layout, base: i64) -> Self {
-        Read { src, layout, base }
+        Read { src, layout, base, nls: Vec::new() }
+    }
+    pub fn with_nls(src: NodeId, layout: Layout, base: i64, nls: Vec<Nl>) -> Self {
+        Read { src, layout, base, nls }
     }
 }
 
@@ -55,6 +59,7 @@ pub enum NodeKind {
         a_idx: Vec<IdxRead>,
         write_idx: Vec<IdxRead>,
         write_base: Option<NodeId>,
+        reduce_max: bool,
     },
     Pointwise { nl: Nl, read: Read },
 }
@@ -108,6 +113,11 @@ impl GraphIr {
         Tensor { id: self.nodes.len() - 1 }
     }
 
+    pub fn push_node(&mut self, node: Node) -> usize {
+        self.nodes.push(node);
+        self.nodes.len() - 1
+    }
+
     pub fn input(&mut self, name: &str, dims: Vec<i64>, dtype: Dt) -> Tensor {
         self.push(NodeKind::Input { name: name.into() }, dims, dtype)
     }
@@ -122,7 +132,7 @@ impl GraphIr {
 
     pub fn pointwise(&mut self, nl: Nl, x: Tensor) -> Tensor {
         let dims = self.dims(x);
-        let read = Read { src: x.id, layout: identity(&dims), base: 0 };
+        let read = Read { src: x.id, layout: identity(&dims), base: 0, nls: Vec::new() };
         self.push(NodeKind::Pointwise { nl, read }, dims, Dt::F32)
     }
 
@@ -135,10 +145,39 @@ impl GraphIr {
         pair: bool,
     ) -> Tensor {
         self.push(
-            NodeKind::Move { a, b, kext, pair, a_idx: Vec::new(), write_idx: Vec::new(), write_base: None },
+            NodeKind::Move { a, b, kext, pair, a_idx: Vec::new(), write_idx: Vec::new(), write_base: None, reduce_max: false },
             dims,
             Dt::F32,
         )
+    }
+
+    pub fn max_last(&mut self, a: Tensor) -> Tensor {
+        let dims = self.dims(a);
+        let (out, k) = dims.split_at(dims.len() - 1);
+        let kext = k[0];
+        let st = rm_strides(&dims);
+        let ra = Read::new(a.id, layout_of(&dims, &st));
+        self.push(
+            NodeKind::Move { a: ra, b: None, kext, pair: true, a_idx: Vec::new(), write_idx: Vec::new(), write_base: None, reduce_max: true },
+            out.to_vec(),
+            Dt::F32,
+        )
+    }
+
+    pub fn add_bcast_row2(&mut self, a: Tensor, b: Tensor) -> Tensor {
+        let dims = self.dims(a);
+        let bdims = self.dims(b);
+        assert_eq!(&dims[..dims.len() - 1], &bdims[..], "add_bcast2 dims");
+        let mut sa = rm_strides(&dims);
+        sa.push(0);
+        let mut sb = rm_strides(&bdims);
+        sb.push(0);
+        sb.push(0);
+        let mut sh = dims.clone();
+        sh.push(2);
+        let ra = Read::new(a.id, layout_of(&sh, &sa));
+        let rb = Read::new(b.id, layout_of(&sh, &sb));
+        self.movn(dims, ra, Some(rb), 2, false)
     }
 
     pub fn mul(&mut self, a: Tensor, b: Tensor) -> Tensor {
@@ -148,8 +187,8 @@ impl GraphIr {
         st.push(0);
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &st), base: 0 };
-        let rb = Read { src: b.id, layout: layout_of(&sh, &st), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &st), base: 0, nls: Vec::new() };
+        let rb = Read { src: b.id, layout: layout_of(&sh, &st), base: 0, nls: Vec::new() };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -164,8 +203,8 @@ impl GraphIr {
         sb.push(0);
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
-        let rb = Read { src: row.id, layout: layout_of(&sh, &sb), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0, nls: Vec::new() };
+        let rb = Read { src: row.id, layout: layout_of(&sh, &sb), base: 0, nls: Vec::new() };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -180,8 +219,8 @@ impl GraphIr {
         sb.push(0);
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
-        let rb = Read { src: b.id, layout: layout_of(&sh, &sb), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0, nls: Vec::new() };
+        let rb = Read { src: b.id, layout: layout_of(&sh, &sb), base: 0, nls: Vec::new() };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -194,8 +233,8 @@ impl GraphIr {
         sb[dims.len()] = 0;
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
-        let rb = Read { src: k.id, layout: layout_of(&sh, &sb), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0, nls: Vec::new() };
+        let rb = Read { src: k.id, layout: layout_of(&sh, &sb), base: 0, nls: Vec::new() };
         self.movn(dims, ra, Some(rb), 1, true)
     }
 
@@ -206,8 +245,8 @@ impl GraphIr {
         sh.push(2);
         let mut st = rm_strides(&dims);
         st.push(0);
-        let ra = Read { src: a.id, layout: layout_of(&sh, &st), base: 0 };
-        let rb = Read { src: b.id, layout: layout_of(&sh, &st), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &st), base: 0, nls: Vec::new() };
+        let rb = Read { src: b.id, layout: layout_of(&sh, &st), base: 0, nls: Vec::new() };
         self.movn(dims, ra, Some(rb), 2, false)
     }
 
@@ -219,8 +258,8 @@ impl GraphIr {
         sa.push(0);
         let mut sb = vec![0i64; dims.len() + 1];
         sb[dims.len()] = 0;
-        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0 };
-        let rb = Read { src: s.id, layout: layout_of(&sh, &sb), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&sh, &sa), base: 0, nls: Vec::new() };
+        let rb = Read { src: s.id, layout: layout_of(&sh, &sb), base: 0, nls: Vec::new() };
         self.movn(dims, ra, Some(rb), 2, false)
     }
 
@@ -229,7 +268,7 @@ impl GraphIr {
         let (out, k) = dims.split_at(dims.len() - 1);
         let kext = k[0];
         let st = rm_strides(&dims);
-        let ra = Read { src: a.id, layout: layout_of(&dims, &st), base: 0 };
+        let ra = Read { src: a.id, layout: layout_of(&dims, &st), base: 0, nls: Vec::new() };
         self.movn(out.to_vec(), ra, None, kext, true)
     }
 
@@ -240,8 +279,8 @@ impl GraphIr {
         assert_eq!(wd[0], k, "matmul inner");
         let n = wd[1];
         let sh = vec![m, n, k];
-        let ra = Read { src: x.id, layout: layout_of(&sh, &[k, 0, 1]), base: 0 };
-        let rb = Read { src: w.id, layout: layout_of(&sh, &[0, 1, n]), base: 0 };
+        let ra = Read { src: x.id, layout: layout_of(&sh, &[k, 0, 1]), base: 0, nls: Vec::new() };
+        let rb = Read { src: w.id, layout: layout_of(&sh, &[0, 1, n]), base: 0, nls: Vec::new() };
         self.movn(vec![m, n], ra, Some(rb), k, true)
     }
 
@@ -251,7 +290,7 @@ impl GraphIr {
         let dims = vec![out_rows, width];
         let mut sh = dims.clone();
         sh.push(1);
-        let ra = Read { src: table.id, layout: layout_of(&sh, &[0, 1, 0]), base: 0 };
+        let ra = Read { src: table.id, layout: layout_of(&sh, &[0, 1, 0]), base: 0, nls: Vec::new() };
         let ir = IdxRead {
             idx: idx.id,
             idx_layout: layout_of(&sh, &[1, 0, 0]),
@@ -266,6 +305,7 @@ impl GraphIr {
                 a_idx: vec![ir],
                 write_idx: Vec::new(),
                 write_base: None,
+                reduce_max: false,
             },
             dims,
             Dt::F32,
@@ -279,7 +319,7 @@ impl GraphIr {
         assert_eq!(rd[1], width, "scatter width");
         let mut sh = rd.clone();
         sh.push(1);
-        let ra = Read { src: rows.id, layout: layout_of(&sh, &[width, 1, 0]), base: 0 };
+        let ra = Read { src: rows.id, layout: layout_of(&sh, &[width, 1, 0]), base: 0, nls: Vec::new() };
         self.scatter_impl(base, idx, ra, width)
     }
 
@@ -315,6 +355,7 @@ impl GraphIr {
                 a_idx: Vec::new(),
                 write_idx: vec![wi],
                 write_base: Some(base.id),
+                reduce_max: false,
             },
             bd,
             Dt::F32,

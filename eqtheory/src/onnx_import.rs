@@ -81,7 +81,7 @@ impl<'a> Lowerer<'a> {
         if contiguous(h) {
             return h.clone();
         }
-        let r = Read { src: h.node, layout: layout_of(&h.shape, &h.strides), base: 0 };
+        let r = Read { src: h.node, layout: layout_of(&h.shape, &h.strides), base: 0, nls: Vec::new() };
         let t = self.g.movn(h.shape.clone(), r, None, 1, true);
         Handle { node: t.id, shape: h.shape.clone(), strides: rm_strides(&h.shape) }
     }
@@ -92,7 +92,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn read(&self, h: &Handle) -> Read {
-        Read { src: h.node, layout: layout_of(&h.shape, &h.strides), base: 0 }
+        Read { src: h.node, layout: layout_of(&h.shape, &h.strides), base: 0, nls: Vec::new() }
     }
 
     fn get(&self, name: &str) -> Handle {
@@ -134,8 +134,8 @@ impl<'a> Lowerer<'a> {
         b_str.push(b.strides[rb - 2]);
         let mut rshape = oshape.clone();
         rshape.push(ka);
-        let ra_read = Read { src: a.node, layout: layout_of(&rshape, &a_str), base: 0 };
-        let rb_read = Read { src: b.node, layout: layout_of(&rshape, &b_str), base: 0 };
+        let ra_read = Read { src: a.node, layout: layout_of(&rshape, &a_str), base: 0, nls: Vec::new() };
+        let rb_read = Read { src: b.node, layout: layout_of(&rshape, &b_str), base: 0, nls: Vec::new() };
         let t = self.g.movn(oshape.clone(), ra_read, Some(rb_read), ka, true);
         self.fresh(t)
     }
@@ -155,8 +155,14 @@ impl<'a> Lowerer<'a> {
             b_str[i] = if bd == 1 { 0 } else { bst };
         }
         if pair {
-            let ra = Read { src: a.node, layout: layout_of(&oshape, &a_str), base: 0 };
-            let rb = Read { src: b.node, layout: layout_of(&oshape, &b_str), base: 0 };
+            let mut psh = oshape.clone();
+            psh.push(1);
+            let mut pa = a_str.clone();
+            pa.push(0);
+            let mut pb = b_str.clone();
+            pb.push(0);
+            let ra = Read { src: a.node, layout: layout_of(&psh, &pa), base: 0, nls: Vec::new() };
+            let rb = Read { src: b.node, layout: layout_of(&psh, &pb), base: 0, nls: Vec::new() };
             let t = self.g.movn(oshape.clone(), ra, Some(rb), 1, true);
             return self.fresh(t);
         }
@@ -164,8 +170,8 @@ impl<'a> Lowerer<'a> {
         sshape.push(2);
         a_str.push(0);
         b_str.push(0);
-        let ra = Read { src: a.node, layout: layout_of(&sshape, &a_str), base: 0 };
-        let rb = Read { src: b.node, layout: layout_of(&sshape, &b_str), base: 0 };
+        let ra = Read { src: a.node, layout: layout_of(&sshape, &a_str), base: 0, nls: Vec::new() };
+        let rb = Read { src: b.node, layout: layout_of(&sshape, &b_str), base: 0, nls: Vec::new() };
         let t = self.g.movn(oshape.clone(), ra, Some(rb), 2, false);
         self.fresh(t)
     }
@@ -266,7 +272,10 @@ impl<'a> Lowerer<'a> {
             "Softmax" => {
                 let x = self.contig(&self.get(&ins[0]));
                 let scaled = self.g.scale(self.tensor(&x), LOG2E);
-                let ex = self.g.pointwise(Nl::Exp2, scaled);
+                let rowmax = self.g.max_last(scaled);
+                let negmax = self.g.scale(rowmax, -1.0);
+                let shifted = self.g.add_bcast_row2(scaled, negmax);
+                let ex = self.g.pointwise(Nl::Exp2, shifted);
                 let denom = self.g.sum_last(ex);
                 let rd = self.g.pointwise(Nl::Recip, denom);
                 let probs = self.g.mul_bcast_row2(ex, rd);

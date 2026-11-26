@@ -3,20 +3,20 @@ use metal::{Buffer, CommandQueue, ComputePipelineState, Device, MTLResourceOptio
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+const PREAMBLE: &str = "#include <metal_stdlib>\nusing namespace metal;\nstatic inline long strided_off(constant int* m, uint i){ long off=m[1]; long r=i; int nm=m[0]; for(int k=0;k<nm;++k){ long sz=m[2+k]; off += (r % sz) * (long)m[10+k]; r/=sz; } return off; }";
+
 pub struct CuteMetal {
     device: Device,
     queue: CommandQueue,
     pipelines: HashMap<&'static str, ComputePipelineState>,
     lib: metal::Library,
     gemv_variants: std::cell::RefCell<HashMap<(u32, u32), ComputePipelineState>>,
-    gemv_choice: std::cell::RefCell<HashMap<(usize, usize, bool), (u32, u32, u32, u64)>>,
     rows_variants: std::cell::RefCell<HashMap<u32, ComputePipelineState>>,
     attn_variants: std::cell::RefCell<HashMap<(u32, u32), ComputePipelineState>>,
-    attn_choice: std::cell::RefCell<HashMap<(usize, usize, usize, bool), (u32, u32, u32, f64)>>,
     gemm_variants: std::cell::RefCell<HashMap<(u32, u32, u32, u32, u32), ComputePipelineState>>,
-    gemm_choice: std::cell::RefCell<HashMap<(usize, usize, usize, i64), Option<(u32, u32, u32, u32, u32)>>>,
-    gemm_ms: std::cell::RefCell<HashMap<(usize, usize, usize, i64), f64>>,
     sample_ctx: std::cell::RefCell<Option<SampleCtx>>,
+    kernels: Vec<Box<dyn crate::kernelset::Kernel>>,
+    ksearch: std::cell::RefCell<HashMap<Vec<i64>, (usize, crate::kernelset::Variant)>>,
 }
 
 pub struct SampleCtx {
@@ -57,14 +57,12 @@ impl CuteMetal {
             pipelines,
             lib,
             gemv_variants: Default::default(),
-            gemv_choice: Default::default(),
             rows_variants: Default::default(),
             attn_variants: Default::default(),
-            attn_choice: Default::default(),
             gemm_variants: Default::default(),
-            gemm_choice: Default::default(),
-            gemm_ms: Default::default(),
             sample_ctx: Default::default(),
+            kernels: crate::kernelset::registry(),
+            ksearch: Default::default(),
         };
         let _ = me.gemv_pipeline(4, 8);
         let _ = me.gemv_rows_pipeline(4);
@@ -98,7 +96,7 @@ impl CuteMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_gemm_sg(
+    pub(crate) fn encode_gemm_sg(
         &self,
         cb: &metal::CommandBufferRef,
         v: (u32, u32, u32, u32, u32),
@@ -135,104 +133,7 @@ impl CuteMetal {
         enc.end_encoding();
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn tune_gemm(
-        &self,
-        m: usize,
-        k: usize,
-        n: usize,
-        ap: [i32; 4],
-        bp: [i32; 4],
-        cp: [i32; 4],
-        batch: &[i32],
-        nbatch: i64,
-    ) -> f64 {
-        let key = (m, k, n, nbatch);
-        if self.gemm_choice.borrow().contains_key(&key) {
-            return *self.gemm_ms.borrow().get(&key).unwrap_or(&f64::INFINITY);
-        }
-        let ap0 = [0, ap[1], ap[2], 0];
-        let bp0 = [0, bp[1], bp[2], 0];
-        let cp0 = [0, cp[1], cp[2], 0];
-        let plan = crate::atoms::mma_plan(&crate::atoms::SG_F32_8X8X8, m, k, n, ap0, bp0, cp0);
-        let candidates = crate::atoms::mma_candidates(m, n, k);
-        if plan.is_none() || candidates.is_empty() || std::env::var("GEMM_NOTUNE").is_ok() {
-            self.gemm_choice.borrow_mut().insert(key, None);
-            self.gemm_ms.borrow_mut().insert(key, f64::INFINITY);
-            return f64::INFINITY;
-        }
-        let foot2 = |s1: i32, n1: usize, s2: i32, n2: usize| -> usize {
-            1 + s1.unsigned_abs() as usize * (n1 - 1) + s2.unsigned_abs() as usize * (n2 - 1)
-        };
-        let bfootx = |col: usize| -> usize {
-            let mut f = 0usize;
-            let nax = batch[0] as usize;
-            for bx in 0..nax {
-                let sz = batch[1 + 4 * bx] as usize;
-                let st = batch[1 + 4 * bx + col].unsigned_abs() as usize;
-                f += (sz - 1) * st;
-            }
-            f
-        };
-        let afoot = (foot2(ap[1], m, ap[2], k) + bfootx(1) + 3) & !3;
-        let bfoot = (foot2(bp[1], k, bp[2], n) + bfootx(2) + 3) & !3;
-        let cfoot = foot2(cp[1], m, 1, n) + bfootx(3);
-        let copies = (96_000_000usize / ((afoot + bfoot) * 4)).clamp(1, 8);
-        let ascratch = self.alloc_bytes(afoot * 4 * copies);
-        let bscratch = self.alloc_bytes(bfoot * 4 * copies);
-        let cscratch = self.alloc_bytes(cfoot * 4);
-        unsafe {
-            std::ptr::write_bytes(ascratch.contents() as *mut u8, 0, afoot * 4 * copies);
-            std::ptr::write_bytes(bscratch.contents() as *mut u8, 0, bfoot * 4 * copies);
-        }
-        let mut best: (f64, Option<(u32, u32, u32, u32, u32)>) = (f64::INFINITY, None);
-        let mut race = |v: Option<(u32, u32, u32, u32, u32)>, best: &mut (f64, Option<(u32, u32, u32, u32, u32)>)| {
-            let run = |iters: usize, offs: usize| {
-                let cb = self.queue.new_command_buffer();
-                for it in 0..iters {
-                    let c = (it + offs) % copies;
-                    let mut app = ap0;
-                    let mut bpp = bp0;
-                    app[0] = (c * afoot) as i32;
-                    bpp[0] = (c * bfoot) as i32;
-                    match v {
-                        Some(vv) => self.encode_gemm_sg(cb, vv, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0, batch, nbatch),
-                        None => {
-                            if nbatch > 1 {
-                                self.bmm_scalar(cb, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0, batch, nbatch as u64);
-                            } else {
-                                self.matmul_into(cb, &ascratch, &bscratch, &cscratch, m, k, n, app, bpp, cp0);
-                            }
-                        }
-                    }
-                }
-                cb.commit();
-                cb.wait_until_completed();
-            };
-            run(1, 0);
-            let t = std::time::Instant::now();
-            run(2, 1);
-            let ms = t.elapsed().as_secs_f64() * 1e3 / 2.0;
-            if ms < best.0 {
-                *best = (ms, v);
-            }
-            ms
-        };
-        let scalar_ms = race(None, &mut best);
-        for v in candidates {
-            race(Some(v), &mut best);
-        }
-        if std::env::var("GEMMTUNE").is_ok() {
-            let gf = 2.0 * (nbatch.max(1) as f64) * m as f64 * k as f64 * n as f64 / (best.0 / 1e3) / 1e9;
-            eprintln!(
-                "gemm tune M={m} K={k} N={n} B={nbatch}: {:?} ({:.3} ms, {:.0} GF/s; scalar {:.3} ms)",
-                best.1, best.0, gf, scalar_ms
-            );
-        }
-        self.gemm_choice.borrow_mut().insert(key, best.1);
-        self.gemm_ms.borrow_mut().insert(key, best.0);
-        best.0
-    }
+
 
 
     pub fn flash_pipeline(&self, sgs: u32, bk: u32) -> ComputePipelineState {
@@ -289,7 +190,7 @@ impl CuteMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn encode_attn(
+    pub(crate) fn encode_attn(
         &self,
         cb: &metal::CommandBufferRef,
         kind: u32,
@@ -320,89 +221,7 @@ impl CuteMetal {
         enc.end_encoding();
     }
 
-    pub fn tune_attn(&self, p: &[i32; 25], vec_ok: bool) -> (u32, u32, u32, f64) {
-        let (kv, g, s, ctx, hd) = (
-            p[0] as usize,
-            p[1] as usize,
-            p[2] as usize,
-            p[3] as usize,
-            p[4] as usize,
-        );
-        let jobs = kv * g * s;
-        let key = (jobs, ctx, hd, vec_ok);
-        if let Some(c) = self.attn_choice.borrow().get(&key) {
-            return *c;
-        }
-        let vec = if vec_ok { 4u32 } else { 1u32 };
-        if std::env::var("ATTN_NOTUNE").is_ok() {
-            self.attn_choice.borrow_mut().insert(key, (0, 1, vec, 0.0));
-            return (0, 1, vec, 0.0);
-        }
-        let foot = |s0: i32, n0: usize, s1: i32, n1: usize, s2: i32, n2: usize, s3: i32, n3: usize| -> usize {
-            1 + s0.max(0) as usize * (n0 - 1)
-                + s1.max(0) as usize * (n1 - 1)
-                + s2.max(0) as usize * (n2 - 1)
-                + s3.max(0) as usize * (n3 - 1)
-        };
-        let kfoot = (foot(p[11], kv, p[12], ctx, p[13], hd, 0, 1) + 3) & !3;
-        let vfoot = (foot(p[15], kv, p[16], ctx, p[17], hd, 0, 1) + 3) & !3;
-        let qfoot = foot(p[6], kv, p[7], g, p[8], s, p[9], hd);
-        let bfoot = foot(p[19], kv, p[20], g, p[21], s, p[22], ctx);
-        let copies = (96_000_000usize / ((kfoot + vfoot) * 4)).clamp(1, 8);
-        let kscratch = self.alloc_bytes(kfoot * 4 * copies);
-        let vscratch = self.alloc_bytes(vfoot * 4 * copies);
-        let qscratch = self.alloc_bytes(qfoot * 4);
-        let bscratch = self.alloc_bytes(bfoot * 4);
-        let oscratch = self.alloc_bytes(jobs * hd * 4);
-        unsafe {
-            std::ptr::write_bytes(qscratch.contents() as *mut u8, 0, qfoot * 4);
-            std::ptr::write_bytes(bscratch.contents() as *mut u8, 0, bfoot * 4);
-            std::ptr::write_bytes(kscratch.contents() as *mut u8, 0, kfoot * 4 * copies);
-            std::ptr::write_bytes(vscratch.contents() as *mut u8, 0, vfoot * 4 * copies);
-        }
-        let mut cands: Vec<(u32, u32, u32)> = Vec::new();
-        for split in [1u32, 2, 4, 8] {
-            if split as usize <= ctx {
-                cands.push((0, split, vec));
-            }
-        }
-        for (sgs, bk) in crate::atoms::flash_candidates(p) {
-            cands.push((1, sgs, bk));
-        }
-        let mut best = (f64::INFINITY, (0u32, 1u32, vec, 0.0f64));
-        for (kind, x, y) in cands {
-            let run = |iters: usize, offs: usize| {
-                let cb = self.queue.new_command_buffer();
-                for it in 0..iters {
-                    let c = (it + offs) % copies;
-                    let mut pp = *p;
-                    pp[5] = 0;
-                    pp[10] = (c * kfoot) as i32;
-                    pp[14] = (c * vfoot) as i32;
-                    pp[18] = 0;
-                    self.encode_attn(cb, kind, x, y, &qscratch, &kscratch, &vscratch, &bscratch, &oscratch, &pp);
-                }
-                cb.commit();
-                cb.wait_until_completed();
-            };
-            run(2, 0);
-            let t = std::time::Instant::now();
-            run(4, 2);
-            let ms = t.elapsed().as_secs_f64() * 1e3 / 4.0;
-            if ms < best.0 {
-                best = (ms, (kind, x, y, ms));
-            }
-        }
-        best.1.3 = best.0;
-        if std::env::var("ATTNTUNE").is_ok() {
-            eprintln!(
-                "attn tune jobs={jobs} ctx={ctx} hd={hd}: kind={} x={} y={} ({:.3} ms)",
-                best.1.0, best.1.1, best.1.2, best.0
-            );
-        }
-        self.attn_choice.borrow_mut().insert(key, best.1);
-        best.1
-    }
+
 
     pub fn gemv_sg_pipeline(&self, csplit: u32) -> ComputePipelineState {
         let key = (100 + csplit, 0);
@@ -430,7 +249,7 @@ impl CuteMetal {
         p
     }
 
-    fn encode_gemv_sg(
+    pub(crate) fn encode_gemv_sg(
         &self,
         cb: &metal::CommandBufferRef,
         pipe: &ComputePipelineState,
@@ -487,7 +306,7 @@ impl CuteMetal {
         p
     }
 
-    fn encode_gemv_rows(
+    pub(crate) fn encode_gemv_rows(
         &self,
         cb: &metal::CommandBufferRef,
         pipe: &ComputePipelineState,
@@ -542,7 +361,7 @@ impl CuteMetal {
         p
     }
 
-    fn encode_gemv_t(
+    pub(crate) fn encode_gemv_t(
         &self,
         cb: &metal::CommandBufferRef,
         pipe: &ComputePipelineState,
@@ -575,104 +394,44 @@ impl CuteMetal {
         enc.end_encoding();
     }
 
-    pub fn tune_gemv(&self, k: usize, n: usize, a: &Buffer, _b: &Buffer, ap: [i32; 4], bp: [i32; 4]) {
-        let col = bp[2] == 1;
-        let rows = !col && bp[1] == 1;
-        if !col && !rows {
-            return;
+
+    pub fn search_cached(&self, comp: &crate::kernelset::Composition) -> (usize, crate::kernelset::Variant) {
+        let key = comp.key();
+        if let Some(c) = self.ksearch.borrow().get(&key) {
+            return *c;
         }
-        let key = (k, n, col);
-        if self.gemv_choice.borrow().contains_key(&key) {
-            return;
-        }
-        if std::env::var("GEMV_NOTUNE").is_ok() {
-            return;
-        }
-        let stride_f = (k * n + 3) & !3;
-        let bytes = stride_f * 4;
-        let copies = (96_000_000usize / bytes).clamp(1, 8);
-        let wscratch = self.alloc_bytes(bytes * copies);
-        let out_scratch = self.alloc_bytes(n * 4);
-        let xap = [0, ap[2], 0, 0];
-        let mut best = (f64::INFINITY, (0u32, 4u32, 8u32, 256u64));
-        let col_vec4 = bp[0] % 4 == 0 && bp[1] % 4 == 0;
-        let rows_vec4 = bp[0] % 4 == 0 && bp[2] % 4 == 0 && k % 4 == 0 && ap[2] == 1;
-        let candidates: Vec<(u32, u32, u32, u64)> = if rows {
-            let rv = if rows_vec4 { 4u32 } else { 1u32 };
-            let mut v = Vec::new();
-            for tg in [128u64, 256u64] {
-                v.push((2u32, rv, 1u32, tg));
-            }
-            v
-        } else {
-            let vecs: &[u32] = if col_vec4 { &[4, 8] } else { &[4] };
-            let mut v = Vec::new();
-            for tg in [128u64, 256u64] {
-                for ncolg in [4u32, 8u32, 16u32] {
-                    let ks = tg / ncolg as u64;
-                    if !(8..=64).contains(&ks) {
-                        continue;
-                    }
-                    for vec in vecs {
-                        v.push((0u32, *vec, ncolg, tg));
-                    }
-                }
-                for csplit in [4u32, 8u32, 16u32] {
-                    v.push((1u32, 4u32, csplit, tg));
-                }
-            }
-            v
-        };
-        for (kind, vec, ncolg, tg) in candidates {
-            let run = |iters: usize, offs: usize| {
-                let cb = self.queue.new_command_buffer();
-                for it in 0..iters {
-                    let off = (((it + offs) % copies) * stride_f) as i32;
-                    let enc_w = &wscratch;
-                    let wbp0 = if rows {
-                        [off, 1, bp[2], 0]
-                    } else {
-                        [off, bp[1], 1, 0]
-                    };
-                    match kind {
-                        2 => {
-                            let pipe = self.gemv_rows_pipeline(vec);
-                            self.encode_gemv_rows(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, tg);
-                        }
-                        1 => {
-                            let pipe = self.gemv_sg_pipeline(ncolg);
-                            self.encode_gemv_sg(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, ncolg, tg);
-                        }
-                        _ => {
-                            let pipe = self.gemv_pipeline(vec, ncolg);
-                            self.encode_gemv_t(cb, &pipe, a, enc_w, &out_scratch, k, n, xap, wbp0, 0, vec, ncolg, tg);
-                        }
-                    }
-                }
-                cb.commit();
-                cb.wait_until_completed();
-            };
-            run(2, 0);
-            let t = std::time::Instant::now();
-            run(4, 2);
-            let ms = t.elapsed().as_secs_f64() * 1e3 / 4.0;
-            if ms < best.0 {
-                best = (ms, (kind, vec, ncolg, tg));
-            }
-        }
-        if std::env::var("GEMVTUNE").is_ok() {
-            eprintln!(
-                "gemv tune K={k} N={n} rows={rows}: kind={} vec={} p={} tg={} ({:.3} ms, {:.1} GB/s)",
-                best.1.0,
-                best.1.1,
-                best.1.2,
-                best.1.3,
-                best.0,
-                bytes as f64 / (best.0 / 1e3) / 1e9
-            );
-        }
-        self.gemv_choice.borrow_mut().insert(key, best.1);
+        let r = crate::kernelset::search(self, &self.kernels, &crate::kernelset::IsolatedBench, comp)
+            .unwrap_or((0, crate::kernelset::Variant([0; 5])));
+        self.ksearch.borrow_mut().insert(key, r);
+        r
     }
+
+    pub fn kernel_index(&self, name: &str) -> usize {
+        self.kernels.iter().position(|k| k.name() == name).expect("kernel name")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn contract_into(&self, cb: &metal::CommandBufferRef, a: &Buffer, b: &Buffer, c: &Buffer, m: usize, k: usize, n: usize, ap: [i32; 4], bp: [i32; 4], cp: [i32; 4], batch: &[i32], nbatch: i64) {
+        let shape = crate::native_exec::ContractShape { m, n, ap, bp, cp, batch: batch.to_vec(), nbatch };
+        let comp = crate::kernelset::Composition::Contraction { shape, kext: k as i64 };
+        let (kidx, variant) = self.search_cached(&comp);
+        self.run_kernel(cb, kidx, variant, &[a.clone(), b.clone(), c.clone()], &comp);
+    }
+
+    pub fn kernel_name(&self, kidx: usize) -> &'static str {
+        self.kernels[kidx].name()
+    }
+
+    pub fn kernel_breaks_cb(&self, kidx: usize) -> bool {
+        self.kernels[kidx].breaks_cb()
+    }
+
+    pub fn run_kernel(&self, cb: &metal::CommandBufferRef, kidx: usize, v: crate::kernelset::Variant, bufs: &[Buffer], comp: &crate::kernelset::Composition) {
+        self.kernels[kidx].dispatch(self, cb, bufs, v, comp);
+    }
+
+
+
 
     pub fn begin_sampling(&self, cap: u64) {
         let ts = self
@@ -752,6 +511,55 @@ impl CuteMetal {
         self.queue.new_command_buffer().to_owned()
     }
 
+    pub fn ensure_reduce_fused(
+        &mut self,
+        name: &'static str,
+        n_ext: usize,
+        stages: &[(String, bool, String)],
+        out_expr: &str,
+    ) {
+        if self.pipelines.contains_key(name) {
+            return;
+        }
+        let b = 1 + n_ext;
+        let mut sig = String::from("    device float* OUT [[buffer(0)]],\n");
+        for k in 0..n_ext {
+            sig += &format!("    device const float* in{k} [[buffer({})]],\n", 1 + k);
+        }
+        sig += &format!("    constant uint& rows [[buffer({b})]],\n");
+        sig += &format!("    constant uint& cols [[buffer({})]],\n", b + 1);
+        for k in 0..n_ext {
+            sig += &format!("    constant int* m{k} [[buffer({})]],\n", b + 2 + k);
+        }
+        let mut body = String::new();
+        for (k, (pre, rmax, vexpr)) in stages.iter().enumerate() {
+            let (init, acc_c, tree_c) = if *rmax {
+                ("-INFINITY", "acc = fmax(acc, pre);", "sh[lane] = fmax(sh[lane], sh[lane+s]);")
+            } else {
+                ("0.0f", "acc = acc + pre;", "sh[lane] = sh[lane] + sh[lane+s];")
+            };
+            body += &format!(
+                "    float t{k};\n    {{ float acc = {init};\n      for (uint j = lane; j < cols; j += 256) {{ uint e = row*cols + j; float pre = {pre}; {acc_c} }}\n      sh[lane] = acc; threadgroup_barrier(mem_flags::mem_threadgroup);\n      for (uint s = 128; s > 0; s >>= 1) {{ if (lane < s) {{ {tree_c} }} threadgroup_barrier(mem_flags::mem_threadgroup); }}\n      t{k} = sh[0]; threadgroup_barrier(mem_flags::mem_threadgroup); }}\n    float v{k} = {vexpr};\n"
+            );
+        }
+        let src = format!(
+            "{PREAMBLE}\nkernel void {name}(\n{sig}    uint lane [[thread_position_in_threadgroup]],\n    uint tgid [[threadgroup_position_in_grid]])\n{{\n    uint row = tgid; if (row >= rows) return;\n    threadgroup float sh[256];\n{body}    for (uint j = lane; j < cols; j += 256) {{ uint e = row*cols + j; OUT[e] = {out_expr}; }}\n}}\n"
+        );
+        let pipe = self.external_pipeline(&src, false, name);
+        self.pipelines.insert(name, pipe);
+    }
+
+    pub fn ensure_fused(&mut self, name: &'static str, hdr: &str, body: &str, root: usize) {
+        if self.pipelines.contains_key(name) {
+            return;
+        }
+        let src = format!(
+            "{PREAMBLE}\nkernel void {name}(\n{hdr}    uint gid [[thread_position_in_grid]])\n{{\n    if (gid >= n) return;\n{body}    OUT[gid] = v{root};\n}}\n"
+        );
+        let pipe = self.external_pipeline(&src, false, name);
+        self.pipelines.insert(name, pipe);
+    }
+
     pub fn external_pipeline(
         &self,
         source: &str,
@@ -803,51 +611,6 @@ impl CuteMetal {
         unsafe { std::slice::from_raw_parts(buf.contents() as *const i32, n) }.to_vec()
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_or_gemv_into(
-        &self,
-        cb: &metal::CommandBufferRef,
-        a: &Buffer,
-        b: &Buffer,
-        c: &Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-        ap: [i32; 4],
-        bp: [i32; 4],
-        cp: [i32; 4],
-    ) {
-        if std::env::var("GENERAL_ONLY").is_ok() {
-            self.matmul_into(cb, a, b, c, m, k, n, ap, bp, cp);
-            return;
-        }
-        if m == 1 && bp[2] == 1 && cp[2] == 1 {
-            let choice = self.gemv_choice.borrow().get(&(k, n, true)).copied();
-            let (kind, vec, p2, tg) = choice.unwrap_or((0, 4, 8, 256));
-            let xap = [ap[0], ap[2], 0, 0];
-            let wbp = [bp[0], bp[1], 0, 0];
-            if kind == 1 {
-                let pipe = self.gemv_sg_pipeline(p2);
-                self.encode_gemv_sg(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], p2, tg);
-            } else {
-                let pipe = self.gemv_pipeline(vec, p2);
-                self.encode_gemv_t(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], vec, p2, tg);
-            }
-        } else if m == 1 && bp[1] == 1 && cp[2] == 1 {
-            let choice = self.gemv_choice.borrow().get(&(k, n, false)).copied();
-            let (_, vec, _, tg) = choice.unwrap_or((2, 4, 1, 256));
-            let pipe = self.gemv_rows_pipeline(vec);
-            let xap = [ap[0], ap[2], 0, 0];
-            let wbp = [bp[0], 1, bp[2], 0];
-            self.encode_gemv_rows(cb, &pipe, a, b, c, k, n, xap, wbp, cp[0], tg);
-        } else {
-            let choice = self.gemm_choice.borrow().get(&(m, k, n, 1)).copied().flatten();
-            match choice {
-                Some(v) => self.encode_gemm_sg(cb, v, a, b, c, m, k, n, ap, bp, cp, &[0], 1),
-                None => self.matmul_into(cb, a, b, c, m, k, n, ap, bp, cp),
-            }
-        }
-    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_into(
@@ -882,39 +645,9 @@ impl CuteMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn bmm_into(
-        &self,
-        cb: &metal::CommandBufferRef,
-        a: &Buffer,
-        b: &Buffer,
-        c: &Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-        ap: [i32; 4],
-        bp: [i32; 4],
-        cp: [i32; 4],
-        batch: &[i32],
-        nbatch: u64,
-    ) {
-        if std::env::var("GENERAL_ONLY").is_err() {
-            let choice = self
-                .gemm_choice
-                .borrow()
-                .get(&(m, k, n, nbatch as i64))
-                .copied()
-                .flatten();
-            if let Some(v) = choice {
-                self.encode_gemm_sg(cb, v, a, b, c, m, k, n, ap, bp, cp, batch, nbatch as i64);
-                return;
-            }
-        }
-        self.bmm_scalar(cb, a, b, c, m, k, n, ap, bp, cp, batch, nbatch);
-    }
 
     #[allow(clippy::too_many_arguments)]
-    fn bmm_scalar(
+    pub(crate) fn bmm_scalar(
         &self,
         cb: &metal::CommandBufferRef,
         a: &Buffer,

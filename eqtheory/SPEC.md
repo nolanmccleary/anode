@@ -190,3 +190,73 @@ measurement that justifies that swap.
   not kernel timings.
 - Every equivalence a rule asserts must be numerically verified against the
   address map it claims to preserve.
+
+## Lowering algorithm (AUTHORITATIVE — specified by the user 2026-11-25)
+
+This is the lowering algorithm. It is TOP-DOWN. Do not deviate.
+
+1. Lower the model graph down into the BASELINE composition graph. KEEP that
+   baseline graph the entire time while you coarsen on top of it. The baseline is
+   never discarded.
+
+2. Coarsen everything to the MAXIMALLY-COARSE composition `R` (the whole model as
+   one composition).
+
+3. When the coarsest form has NO available kernel, BREAK OFF THE LAST
+   TRANSFORMATION — the tail end, the last transformation before the output.
+
+   - Write the composition as `R = A ∘ B`. Cecka's guarantee (arXiv:2603.02298):
+     `R` is COMPATIBLE with `B`, for any two compositions `A` and `B`.
+   - `A` and `B` may themselves be COMPOUND compositions.
+   - Because `R` is compatible with `B`, breaking off the tail of `B` CHANGES THE
+     SHAPE of `R`, and the trimmed `R` may now have a valid kernel.
+
+4. Keep breaking off kernels as you go. AT THE SAME TIME, try to MERGE each
+   broken-off kernel with its POSTERIOR (its downstream neighbor) wherever a merged
+   kernel is available.
+
+5. Assumption: MORE FUSION IS ALWAYS GOOD. The process therefore converges on the
+   most-well-fused system.
+
+Worked example: `A = XYV`, `B = LQZ`, so `R = A ∘ B = XYVLQZ`. If `Z` (the last
+transformation) has no kernel, break `Z` off: `R` becomes `(XYVLQ)` and `Z` — two
+kernels. Then try to merge `Z` with its posterior.
+
+WRONG (current code): `src/coarsen.rs` is BOTTOM-UP greedy fusion (start from the
+decomposed primitives and fuse upward). That is the opposite of this algorithm and
+must be replaced. The correct system keeps the baseline, coarsens to the maximum,
+then tail-breaks only when no kernel exists, merging with posteriors as it goes.
+
+### The two axioms (user-specified 2026-11-25)
+
+1. MORE FUSION IS GOOD. Fusion amount is NEVER a cost decision. Always go to the
+   coarsest VALID composition. The only thing that forces a split is VALIDITY — no
+   kernel services the coarse form (the tail-break above). Cost never causes a split.
+
+2. GIVEN AXIOM 1, COST-BENCHMARK ONLY ALTERNATIVES WITHIN A FUSION CLASS. Once you
+   have the coarsest valid composition, if more than one kernel services THAT SAME
+   composition (variants / tilings / algorithms), cost-benchmark those and pick the
+   cheapest. The search space is ONLY the coarsest valid kernels. We do NOT measure
+   subkernels (split / less-fused forms) unless the tail-break has forced a split
+   because no valid coarse kernel exists.
+
+Corollary: never cost "fused vs decomposed". That measures a split form, which axiom
+2 forbids outside a forced split. Cost only ranks same-composition kernel choices.
+
+## The isolated profiler is garbage (LAW — user-specified 2026-11-25)
+
+The per-kernel micro-benchmark (`tune_gemm` / `tune_gemv`) is NOT a valid signal. It
+times a kernel in isolation. It does NOT reflect inline (hot-path) performance.
+
+Evidence: `gemm_mlx` benchmarks ~7x the scalar fallback and beats `gemm_sg` in the
+isolated profiler. Inline it changes ttft by zero (within run-to-run noise). The
+isolated winner is not the hot-path winner.
+
+Rules when you add or test a kernel:
+
+1. NEVER make a verdict from isolated profiler numbers. They mean nothing.
+2. FORCE the new kernel on. Do not rely on the profiler to select it.
+3. Run the REAL pipeline (hot path). Measure the hot profile.
+4. The metric is decode tok/s. ttft is NOT relevant.
+5. Always introspect whether the HOT profile actually dispatches the kernel and
+   whether tok/s moves. State that, not the isolated number.

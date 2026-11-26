@@ -55,6 +55,8 @@ pub const KERNELS: &[(&str, NodeType)] = &[
     ("rsqrt_s", NodeType::Pointwise(Pointwise::Rsqrt)),
     ("gemv_n4", NodeType::Move),
     ("rmsnorm_row", NodeType::Move),
+    ("gemv_mlx", NodeType::Move),
+    ("gemm_mlx", NodeType::Move),
     ("silu_mul", NodeType::Move),
     ("ew_chain", NodeType::Move),
     ("attn_decode", NodeType::Move),
@@ -94,6 +96,20 @@ static inline long strided_off(constant int* m, uint i) {
     return off;
 }
 
+static inline float apply_nls(float x, uint ops) {
+    for (uint k = 0; k < 8u; ++k) {
+        uint op = (ops >> (4u * k)) & 0xFu;
+        if (op == 0u) break;
+        if (op == 1u) x = exp2(x);
+        else if (op == 2u) x = 1.0f / x;
+        else if (op == 3u) x = sqrt(x);
+        else if (op == 4u) x = rsqrt(x);
+        else if (op == 5u) x = max(x, 0.0f);
+        else if (op == 6u) x = x > 0.0f ? 1.0f : 0.0f;
+    }
+    return x;
+}
+
 kernel void copy_strided(
     device const float* SRC [[buffer(0)]],
     device float*       DST [[buffer(1)]],
@@ -123,10 +139,12 @@ kernel void add_strided(
     constant uint&      n  [[buffer(3)]],
     constant int*       ma [[buffer(4)]],
     constant int*       mb [[buffer(5)]],
+    constant uint&      opa [[buffer(6)]],
+    constant uint&      opb [[buffer(7)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= n) return;
-    C[gid] = A[strided_off(ma, gid)] + B[strided_off(mb, gid)];
+    C[gid] = apply_nls(A[strided_off(ma, gid)], opa) + apply_nls(B[strided_off(mb, gid)], opb);
 }
 
 kernel void mul_strided(
@@ -136,10 +154,12 @@ kernel void mul_strided(
     constant uint&      n  [[buffer(3)]],
     constant int*       ma [[buffer(4)]],
     constant int*       mb [[buffer(5)]],
+    constant uint&      opa [[buffer(6)]],
+    constant uint&      opb [[buffer(7)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= n) return;
-    C[gid] = A[strided_off(ma, gid)] * B[strided_off(mb, gid)];
+    C[gid] = apply_nls(A[strided_off(ma, gid)], opa) * apply_nls(B[strided_off(mb, gid)], opb);
 }
 
 kernel void recip_o(
@@ -506,6 +526,148 @@ kernel void gemv_t(
     }
 }
 
+kernel void gemm_mlx(
+    device const float* A    [[buffer(0)]],
+    device const float* B    [[buffer(1)]],
+    device float*       C    [[buffer(2)]],
+    constant int4&      dims [[buffer(3)]],
+    constant int4&      ap   [[buffer(4)]],
+    constant int4&      bp   [[buffer(5)]],
+    constant int4&      cp   [[buffer(6)]],
+    constant int*       bat  [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sgid [[simdgroup_index_in_threadgroup]])
+{
+    const int BM = 64, BN = 64, BK = 16;
+    const int WN = 4, TM = 4, TN = 2;
+    int m = dims.x, k = dims.y, n = dims.z;
+    long aboff = 0, bboff = 0, cboff = 0;
+    int nax = bat[0];
+    int rz = int(tgid.z);
+    for (int bx = 0; bx < nax; ++bx) {
+        int sz = bat[1 + 4 * bx];
+        int ii = rz % sz; rz /= sz;
+        aboff += (long)ii * bat[2 + 4 * bx];
+        bboff += (long)ii * bat[3 + 4 * bx];
+        cboff += (long)ii * bat[4 + 4 * bx];
+    }
+    long am = ap.y, ak = ap.z, bk = bp.y, bn = bp.z, cm = cp.y, cn = cp.z;
+    int i0 = int(tgid.y) * BM;
+    int j0 = int(tgid.x) * BN;
+    int sgm = int(sgid) / WN;
+    int sgn = int(sgid) % WN;
+    threadgroup float As[BM * BK];
+    threadgroup float Bs[BK * BN];
+    simdgroup_float8x8 acc[TM][TN];
+    for (int i = 0; i < TM; ++i)
+        for (int j = 0; j < TN; ++j)
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    uint nth = 32u * 8u;
+    uint tid = sgid * 32 + lane;
+    bool av = (ak == 1);
+    bool bv = (bn == 1);
+    for (int kk = 0; kk < k; kk += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (av) {
+            uint fx = tid;
+            int r = int(fx) / (BK / 4);
+            int c4 = (int(fx) % (BK / 4)) * 4;
+            float4 va = float4(0.0);
+            if (i0 + r < m) va = *(device const float4*)(A + long(ap.x) + aboff + (long)(i0 + r) * am + (long)(kk + c4) * ak);
+            *(threadgroup float4*)(As + r * BK + c4) = va;
+        } else {
+            for (uint x = tid; x < uint(BM * BK); x += nth) {
+                int r = int(x) / BK, c = int(x) % BK;
+                As[r * BK + c] = (i0 + r < m) ? A[long(ap.x) + aboff + (long)(i0 + r) * am + (long)(kk + c) * ak] : 0.0f;
+            }
+        }
+        if (bv) {
+            uint fx = tid;
+            int c = int(fx) / (BN / 4);
+            int j4 = (int(fx) % (BN / 4)) * 4;
+            float4 vb = float4(0.0);
+            if (j0 + j4 < n) vb = *(device const float4*)(B + long(bp.x) + bboff + (long)(kk + c) * bk + (long)(j0 + j4) * bn);
+            *(threadgroup float4*)(Bs + c * BN + j4) = vb;
+        } else {
+            for (uint x = tid; x < uint(BK * BN); x += nth) {
+                int c = int(x) / BN, j = int(x) % BN;
+                Bs[c * BN + j] = (j0 + j < n) ? B[long(bp.x) + bboff + (long)(kk + c) * bk + (long)(j0 + j) * bn] : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kc = 0; kc < BK; kc += 8) {
+            simdgroup_float8x8 af[TM], bf[TN];
+            for (int i = 0; i < TM; ++i)
+                simdgroup_load(af[i], &As[(sgm * TM + i) * 8 * BK + kc], BK);
+            for (int j = 0; j < TN; ++j)
+                simdgroup_load(bf[j], &Bs[kc * BN + (sgn * TN + j) * 8], BN);
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j)
+                    simdgroup_multiply_accumulate(acc[i][j], af[i], bf[j], acc[i][j]);
+        }
+    }
+    for (int i = 0; i < TM; ++i) {
+        for (int j = 0; j < TN; ++j) {
+            int ci = i0 + (sgm * TM + i) * 8;
+            int cj = j0 + (sgn * TN + j) * 8;
+            if (ci < m && cj < n)
+                simdgroup_store(acc[i][j], &C[long(cp.x) + cboff + (long)ci * cm + (long)cj * cn], ulong(cm));
+        }
+    }
+}
+
+kernel void gemv_mlx(
+    device const float* X   [[buffer(0)]],
+    device const float* W   [[buffer(1)]],
+    device float*       OUT [[buffer(2)]],
+    constant uint&      K   [[buffer(3)]],
+    constant uint&      N   [[buffer(4)]],
+    constant int4&      ap  [[buffer(5)]],
+    constant int4&      bp  [[buffer(6)]],
+    constant int&       co  [[buffer(7)]],
+    uint tid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tptg [[threads_per_threadgroup]])
+{
+    const uint SN = 8;
+    const uint SK = 4;
+    const uint VEC = 4;
+    uint sg = tid / 32;
+    uint lane = tid % 32;
+    uint sn = lane % SN;
+    uint sk = lane / SN;
+    uint n_sgs = tptg / 32;
+    uint n0 = (tgid * n_sgs + sg) * (SN * VEC) + sn * VEC;
+    int xo = ap.x, xs = ap.y;
+    int wo = bp.x, ws = bp.y;
+    float4 acc = float4(0.0);
+    bool vec_ok = (n0 + VEC <= N) && (ws % 4 == 0) && ((wo + int(n0)) % 4 == 0);
+    if (vec_ok) {
+        device const float4* W4 = (device const float4*)(W + wo + n0);
+        uint ws4 = uint(ws) / 4u;
+        for (uint k = sk; k < K; k += SK) {
+            acc += X[xo + int(k) * xs] * W4[k * ws4];
+        }
+    } else if (n0 < N) {
+        for (uint k = sk; k < K; k += SK) {
+            float xv = X[xo + int(k) * xs];
+            for (uint j = 0; j < VEC; ++j)
+                if (n0 + j < N) acc[j] += xv * W[wo + int(k) * ws + int(n0 + j)];
+        }
+    }
+    for (uint s = SN; s < 32u; s <<= 1) {
+        acc.x += simd_shuffle_down(acc.x, s);
+        acc.y += simd_shuffle_down(acc.y, s);
+        acc.z += simd_shuffle_down(acc.z, s);
+        acc.w += simd_shuffle_down(acc.w, s);
+    }
+    if (sk == 0 && n0 < N) {
+        for (uint j = 0; j < VEC; ++j)
+            if (n0 + j < N) OUT[co + n0 + j] = acc[j];
+    }
+}
+
 kernel void gemv_sg_t(
     device const float* X   [[buffer(0)]],
     device const float* W   [[buffer(1)]],
@@ -732,6 +894,7 @@ kernel void reduce_sum_l(
     constant uint&      axis  [[buffer(3)]],
     constant uint&      inner [[buffer(4)]],
     constant int*       m     [[buffer(5)]],
+    constant uint&      opx  [[buffer(6)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= outer * inner) return;
@@ -739,7 +902,7 @@ kernel void reduce_sum_l(
     uint in_ = gid % inner;
     float s = 0.0;
     for (uint a = 0; a < axis; ++a) {
-        s += X[strided_off(m, (o * axis + a) * inner + in_)];
+        s += apply_nls(X[strided_off(m, (o * axis + a) * inner + in_)], opx);
     }
     OUT[gid] = s;
 }
@@ -751,6 +914,7 @@ kernel void reduce_max_l(
     constant uint&      axis  [[buffer(3)]],
     constant uint&      inner [[buffer(4)]],
     constant int*       m     [[buffer(5)]],
+    constant uint&      opx  [[buffer(6)]],
     uint gid [[thread_position_in_grid]])
 {
     if (gid >= outer * inner) return;
@@ -758,7 +922,7 @@ kernel void reduce_max_l(
     uint in_ = gid % inner;
     float v = -INFINITY;
     for (uint a = 0; a < axis; ++a) {
-        v = max(v, X[strided_off(m, (o * axis + a) * inner + in_)]);
+        v = max(v, apply_nls(X[strided_off(m, (o * axis + a) * inner + in_)], opx));
     }
     OUT[gid] = v;
 }
@@ -1356,3 +1520,73 @@ kernel void softmax_rows(
     for (uint j = 0; j < cols; ++j) row[j] /= s;
 }
 "#;
+
+use crate::metal_backend::CuteMetal;
+use metal::{Buffer, MTLSize};
+use std::ffi::c_void;
+
+impl CuteMetal {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_gemm_mlx(
+        &self,
+        cb: &metal::CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        c: &Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+        ap: [i32; 4],
+        bp: [i32; 4],
+        cp: [i32; 4],
+        batch: &[i32],
+        nbatch: i64,
+    ) {
+        let enc = self.enc(cb, "gemm_mlx");
+        enc.set_compute_pipeline_state(self.pipeline("gemm_mlx"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(c), 0);
+        let dims = [m as i32, k as i32, n as i32, 0];
+        enc.set_bytes(3, 16, dims.as_ptr() as *const c_void);
+        enc.set_bytes(4, 16, ap.as_ptr() as *const c_void);
+        enc.set_bytes(5, 16, bp.as_ptr() as *const c_void);
+        enc.set_bytes(6, 16, cp.as_ptr() as *const c_void);
+        enc.set_bytes(7, (batch.len() * 4) as u64, batch.as_ptr() as *const c_void);
+        enc.dispatch_thread_groups(
+            MTLSize::new((n as u64).div_ceil(64), (m as u64).div_ceil(64), nbatch as u64),
+            MTLSize::new(256, 1, 1),
+        );
+        enc.end_encoding();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_gemv_mlx(
+        &self,
+        cb: &metal::CommandBufferRef,
+        a: &Buffer,
+        b: &Buffer,
+        c: &Buffer,
+        k: usize,
+        n: usize,
+        xap: [i32; 4],
+        wbp: [i32; 4],
+        co: i32,
+        tg: u64,
+    ) {
+        let enc = self.enc(cb, "gemv_mlx");
+        enc.set_compute_pipeline_state(self.pipeline("gemv_mlx"));
+        enc.set_buffer(0, Some(a), 0);
+        enc.set_buffer(1, Some(b), 0);
+        enc.set_buffer(2, Some(c), 0);
+        let (ku, nu) = (k as u32, n as u32);
+        enc.set_bytes(3, 4, &ku as *const u32 as *const c_void);
+        enc.set_bytes(4, 4, &nu as *const u32 as *const c_void);
+        enc.set_bytes(5, 16, xap.as_ptr() as *const c_void);
+        enc.set_bytes(6, 16, wbp.as_ptr() as *const c_void);
+        enc.set_bytes(7, 4, &co as *const i32 as *const c_void);
+        let tgs = (n as u64).div_ceil(tg);
+        enc.dispatch_thread_groups(MTLSize::new(tgs, 1, 1), MTLSize::new(tg, 1, 1));
+        enc.end_encoding();
+    }
+}

@@ -23,6 +23,21 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=proto/onnx.proto");
     prost_build::compile_protos(&["proto/onnx.proto"], &["proto"]).expect("compile onnx.proto");
+
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let mlx_root = format!("{manifest}/.venv/lib/python3.11/site-packages/mlx");
+    let mlx_inc = format!("{mlx_root}/include");
+    let mlx_lib = format!("{mlx_root}/lib");
+    println!("cargo:rerun-if-changed=mlxshim/llama.cpp");
+    cc::Build::new()
+        .cpp(true)
+        .std("c++17")
+        .file("mlxshim/llama.cpp")
+        .include(&mlx_inc)
+        .compile("mlxshim");
+    println!("cargo:rustc-link-search=native={mlx_lib}");
+    println!("cargo:rustc-link-lib=dylib=mlx");
+    println!("cargo:mlxlib={mlx_lib}");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=bin");
     println!("cargo:rerun-if-changed=tests");
@@ -155,23 +170,29 @@ fn main() {
         }
     }
 
-    // === universal-egraph-rules (RULES.md) ===
-    // The e-graph may carry ONLY mathematically universal laws: CuTe layout
-    // identities (composition, coalesce, tiling via zipped_divide, complement,
-    // products) and the fixed semiring laws (distributivity, associativity,
-    // commutativity). A fused kernel must EMERGE as a cost-ranked extraction
-    // over that universal e-graph, never as a bespoke merge rule. Every
-    // datatype/relation/function/sort an egglog program declares must name a
-    // universal term; implementation-named fusions (rms/silu/attn/qkv/merge/…)
-    // are banned. Add a term here ONLY with the universal law it instantiates.
+    // === canonical-cute-egraph (RULES.md) ===
+    // The ONLY things admissible on the e-graph are (1) semimodule-tagged LAYOUT
+    // terms (a layout is a function domain->codomain whose stride lives in an
+    // integer-semimodule; the semimodule is a first-class equivalence attribute),
+    // and (2) the layout EQUIVALENCE RELATIONS Cris Cecka DEFINES in the
+    // definitive paper (arXiv:2603.02298): composition, complement, coalesce,
+    // logical/zipped division, (left/right) inverse, products. If a method is not
+    // a defined functional equivalence relation in that paper, it must NOT be an
+    // e-graph operation. Every datatype/relation/function/sort an egglog program
+    // declares must be one of these; invented op-datatypes (the former `Val` with
+    // Contract/Concat/Mul/Add/Sum/Max/Pt/... and ad-hoc distributivity/softmax
+    // rewrites) are BANNED. See [[cute-layout-is-a-function]], Cecka definitive.
     let universal_egraph_decls = [
-        "LT",       // layout term datatype (CLit/Compose) — CuTe composition+coalesce
-        "Data",     // a layout under decomposition
-        "Spec",     // a tiling spec — zipped_divide, a CuTe layout law
-        "Serviced", // result of applying cute-tile-mode (zipped_divide)
-        "Val",      // tensor-value term (In/Contract/Concat/Slice) — the fixed (+,x)
-                    // contraction + generic concat/slice; carries distributivity &
-                    // reduction-reassociation, both universal semiring laws
+        "LT",       // layout term datatype (CLit/Compose) — Cecka 3.3 composition
+        "Data",     // a layout under refinement
+        "Spec",     // a tiling spec — zipped_divide (Cecka 3.5.2), a defined relation
+        "Serviced", // result of cute-tile-mode (zipped_divide)
+    ];
+    // egglog primitives (add_primitive!) must be Cecka-defined layout operations.
+    let canonical_cute_primitives = [
+        "cute-compose", "cute-coalesce", "cute-complement",
+        "cute-divide", "cute-tile-mode", "cute-product",
+        "cute-inverse", "cute-left-inverse", "cute-right-inverse",
     ];
     let egraph_decls = ["(relation ", "(datatype ", "(function ", "(sort "];
 
@@ -190,9 +211,24 @@ fn main() {
                     .collect();
                 if !term.is_empty() && !universal_egraph_decls.contains(&term.as_str()) {
                     bad.push(format!(
-                        "{} (declares e-graph term `{term}` — only mathematically universal CuTe/semiring laws may live in the e-graph; special-implementation fusion rules must EMERGE from cost-ranked extraction, not be hand-coded)",
-                        at("universal-egraph-rules")
+                        "{} (declares e-graph term `{term}` — the e-graph admits ONLY semimodule-tagged layout terms + Cecka-defined equivalence relations; invented op-datatypes are banned)",
+                        at("canonical-cute-egraph")
                     ));
+                }
+            }
+        }
+        for (i, _) in text.match_indices("add_primitive!") {
+            let rest = &text[i..];
+            if let Some(q0) = rest.find('"') {
+                let after = &rest[q0 + 1..];
+                if let Some(q1) = after.find('"') {
+                    let prim = &after[..q1];
+                    if !canonical_cute_primitives.contains(&prim) {
+                        bad.push(format!(
+                            "{} (e-graph primitive `{prim}` — only Cecka-defined CuTe layout operations may back e-graph rewrites)",
+                            at("canonical-cute-egraph")
+                        ));
+                    }
                 }
             }
         }

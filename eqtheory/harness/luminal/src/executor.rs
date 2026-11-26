@@ -1314,11 +1314,7 @@ impl<'g> Exec<'g> {
                     enc.end_encoding();
                 }
                 Tape::Matmul { a, b, c, m, k, n, ap, bp, cp, batch, nbatch } => {
-                    if *nbatch > 1 {
-                        self.backend.bmm_into(cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
-                    } else {
-                        self.backend.matmul_or_gemv_into(cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
-                    }
+                    self.backend.contract_into(cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch);
                 }
             }
         }
@@ -1495,20 +1491,18 @@ impl<'g> Exec<'g> {
                     None => self.vals[&plan.b_base].buf.clone(),
                 };
                 let out = self.alloc(n_out as usize * 4);
-                if plan.nbatch == 1
-                    && plan.m == 1
-                    && (plan.bp[2] == 1 || plan.bp[1] == 1)
-                    && std::env::var("GENERAL_ONLY").is_err()
-                {
-                    self.backend.tune_gemv(
-                        plan.k as usize,
-                        plan.n as usize,
-                        &a_buf,
-                        &b_buf,
-                        plan.ap,
-                        plan.bp,
-                    );
-                }
+                let _ = self.backend.search_cached(&eqtheory::kernelset::Composition::Contraction {
+                    shape: eqtheory::native_exec::ContractShape {
+                        m: plan.m as usize,
+                        n: plan.n as usize,
+                        ap: plan.ap,
+                        bp: plan.bp,
+                        cp: [0, plan.n as i32, 1, 0],
+                        batch: plan.batch.clone(),
+                        nbatch: plan.nbatch,
+                    },
+                    kext: plan.k as i64,
+                });
                 self.tape.borrow_mut().push(Tape::Matmul {
                     a: a_buf,
                     b: b_buf,
@@ -1794,11 +1788,7 @@ impl<'g> Exec<'g> {
         while i < tape.len() {
             match &tape[i] {
                 Tape::Matmul { a, b, c, m, k, n, ap, bp, cp, batch, nbatch } => {
-                    if *nbatch > 1 {
-                        self.backend.bmm_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
-                    } else {
-                        self.backend.matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
-                    }
+                    self.backend.contract_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch);
                     i += 1;
                 }
                 _ => {

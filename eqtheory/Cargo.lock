@@ -3216,6 +3216,7 @@ name = "eqtheory"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cc",
  "cute-layout",
  "egglog 2.0.0 (git+https://github.com/egraphs-good/egglog?rev=3787810fa259efc45237eecd98d7914a6b02256c)",
  "metal",

@@ -5,6 +5,7 @@ members = [".", "harness/luminal", "harness/cute", "harness/burn"]
 name = "eqtheory"
 version = "0.1.0"
 edition = "2024"
+links = "mlxshim"
 
 [dependencies]
 cute-layout = { path = "../refs/cuda-rust/cuda-oxide/cute-rs-preview/cute-layout" }
@@ -16,6 +17,7 @@ prost = "0.13"
 
 [build-dependencies]
 prost-build = "0.13"
+cc = "1"
 
 [[bin]]
 name = "compression"
@@ -42,10 +44,6 @@ name = "tmbench"
 path = "bin/tmbench.rs"
 
 [[bin]]
-name = "gemvbench"
-path = "bin/gemvbench.rs"
-
-[[bin]]
 name = "nativerun"
 path = "bin/nativerun.rs"
 
@@ -68,31 +66,3 @@ path = "bin/onnxsession.rs"
 [[bin]]
 name = "decodediff"
 path = "bin/decodediff.rs"
-
-[[bin]]
-name = "distribute"
-path = "bin/distribute.rs"
-
-[[bin]]
-name = "stabilize"
-path = "bin/stabilize.rs"
-
-[[bin]]
-name = "mapgraph"
-path = "bin/mapgraph.rs"
-
-[[bin]]
-name = "derive"
-path = "bin/derive.rs"
-
-[[bin]]
-name = "merge"
-path = "bin/merge.rs"
-
-[[bin]]
-name = "extract"
-path = "bin/extract.rs"
-
-[[bin]]
-name = "cogroup"
-path = "bin/cogroup.rs"

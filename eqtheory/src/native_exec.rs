@@ -1,5 +1,4 @@
 use crate::ir::{Dt, GraphIr, IdxRead, Nl, NodeKind, Read};
-use crate::native_fuse;
 use crate::metal_backend::CuteMetal;
 use cute_layout::{IntTuple, Layout};
 use metal::Buffer;
@@ -54,6 +53,141 @@ fn numel(d: &[i64]) -> i64 {
     d.iter().product()
 }
 
+fn nl_c(nl: Nl, x: &str) -> String {
+    match nl {
+        Nl::Exp2 => format!("exp2({x})"),
+        Nl::Recip => format!("(1.0f/({x}))"),
+        Nl::Sqrt => format!("sqrt({x})"),
+        Nl::Rsqrt => format!("rsqrt({x})"),
+        Nl::Relu => format!("max({x}, 0.0f)"),
+        Nl::Step => format!("(({x}) > 0.0f ? 1.0f : 0.0f)"),
+        Nl::CastF32 => format!("({x})"),
+    }
+}
+
+fn opref(
+    read: &Read,
+    inset: &std::collections::HashSet<usize>,
+    ext: &mut Vec<(usize, [i32; 18])>,
+    slot: &mut std::collections::HashMap<String, usize>,
+) -> String {
+    if inset.contains(&read.src) {
+        return format!("v{}", read.src);
+    }
+    let (sh, st) = axes_of(&read.layout);
+    let take = if st.last() == Some(&0) { sh.len().saturating_sub(1) } else { sh.len() };
+    let meta = meta_from_axes(&sh, &st, take).unwrap_or_else(|| flat_meta(1));
+    let key = format!("{}:{:?}", read.src, &meta[..]);
+    let k = if let Some(k) = slot.get(&key) {
+        *k
+    } else {
+        let k = ext.len();
+        ext.push((read.src, meta));
+        slot.insert(key, k);
+        k
+    };
+    format!("in{k}[strided_off(m{k}, gid)]")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gen_operand(
+    g: &GraphIr,
+    read: &Read,
+    internal: &std::collections::HashSet<usize>,
+    special: &std::collections::HashMap<usize, String>,
+    idx: &str,
+    ext: &mut Vec<(usize, [i32; 18])>,
+    slot: &mut std::collections::HashMap<String, usize>,
+) -> String {
+    if let Some(v) = special.get(&read.src) {
+        return v.clone();
+    }
+    if internal.contains(&read.src) {
+        return gen_node(g, read.src, internal, special, idx, ext, slot);
+    }
+    let (sh, st) = axes_of(&read.layout);
+    let take = if st.last() == Some(&0) { sh.len().saturating_sub(1) } else { sh.len() };
+    let meta = meta_from_axes(&sh, &st, take).unwrap_or_else(|| flat_meta(1));
+    let key = format!("{}:{:?}", read.src, &meta[..]);
+    let k = if let Some(k) = slot.get(&key) {
+        *k
+    } else {
+        let k = ext.len();
+        ext.push((read.src, meta));
+        slot.insert(key, k);
+        k
+    };
+    format!("in{k}[strided_off(m{k}, {idx})]")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gen_node(
+    g: &GraphIr,
+    id: usize,
+    internal: &std::collections::HashSet<usize>,
+    special: &std::collections::HashMap<usize, String>,
+    idx: &str,
+    ext: &mut Vec<(usize, [i32; 18])>,
+    slot: &mut std::collections::HashMap<String, usize>,
+) -> String {
+    match &g.nodes[id].kind {
+        NodeKind::Pointwise { nl, read } => {
+            let o = gen_operand(g, read, internal, special, idx, ext, slot);
+            nl_c(*nl, &o)
+        }
+        NodeKind::Move { a, b, pair, .. } => {
+            let ae = gen_operand(g, a, internal, special, idx, ext, slot);
+            match b {
+                Some(b) => {
+                    let be = gen_operand(g, b, internal, special, idx, ext, slot);
+                    if *pair { format!("({ae} * {be})") } else { format!("({ae} + {be})") }
+                }
+                None => ae,
+            }
+        }
+        _ => "0.0f".into(),
+    }
+}
+
+fn gen_region_body(g: &GraphIr, region: &[usize]) -> (String, String, Vec<(usize, [i32; 18])>) {
+    let inset: std::collections::HashSet<usize> = region.iter().copied().collect();
+    let mut ext: Vec<(usize, [i32; 18])> = Vec::new();
+    let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut nodes = region.to_vec();
+    nodes.sort_unstable();
+    let mut body = String::new();
+    for &id in &nodes {
+        let e = match &g.nodes[id].kind {
+            NodeKind::Pointwise { nl, read } => {
+                let o = opref(read, &inset, &mut ext, &mut slot);
+                nl_c(*nl, &o)
+            }
+            NodeKind::Move { a, b, pair, .. } => {
+                let ae = opref(a, &inset, &mut ext, &mut slot);
+                match b {
+                    Some(b) => {
+                        let be = opref(b, &inset, &mut ext, &mut slot);
+                        if *pair { format!("{ae} * {be}") } else { format!("{ae} + {be}") }
+                    }
+                    None => ae,
+                }
+            }
+            _ => "0.0f".into(),
+        };
+        body += &format!("    float v{id} = {e};\n");
+    }
+    let b = 1 + ext.len();
+    let mut hdr = String::from("    device float* OUT [[buffer(0)]],\n");
+    for k in 0..ext.len() {
+        hdr += &format!("    device const float* in{k} [[buffer({})]],\n", 1 + k);
+    }
+    hdr += &format!("    constant uint& n [[buffer({b})]],\n");
+    for k in 0..ext.len() {
+        hdr += &format!("    constant int* m{k} [[buffer({})]],\n", b + 1 + k);
+    }
+    (hdr, body, ext)
+}
+
 enum Tape {
     Run1d {
         kernel: &'static str,
@@ -65,44 +199,15 @@ enum Tape {
         progs: Vec<(u64, [i32; 25])>,
         n: u64,
     },
-    Mm {
-        a: Buffer,
-        b: Buffer,
-        c: Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-        ap: [i32; 4],
-        bp: [i32; 4],
-        cp: [i32; 4],
-        batch: Vec<i32>,
-        nbatch: i64,
+    Kernel {
+        kidx: usize,
+        variant: crate::kernelset::Variant,
+        bufs: Vec<Buffer>,
+        comp: crate::kernelset::Composition,
     },
 }
 
-fn unclaim_attn_head(
-    g: &GraphIr,
-    users: &[Vec<usize>],
-    fusions: &mut native_fuse::Fusions,
-    id: usize,
-    sc: usize,
-) {
-    let scaled = users[sc][0];
-    let biased = users[scaled][0];
-    let l2 = users[biased][0];
-    let ex = users[l2][0];
-    let den = *users[ex]
-        .iter()
-        .find(|u| matches!(&g.nodes[**u].kind, NodeKind::Move { b: None, kext, .. } if *kext > 1))
-        .expect("attn den");
-    let rd = users[den][0];
-    let probs = *users[ex].iter().find(|u| **u != den).expect("attn probs");
-    for nid in [sc, scaled, biased, l2, ex, den, rd, probs] {
-        fusions.claims.remove(&nid);
-    }
-    fusions.attn.remove(&id);
-}
-
+#[derive(Clone)]
 pub struct ContractShape {
     pub m: usize,
     pub n: usize,
@@ -118,7 +223,7 @@ pub fn classify_contract(a: &Read, b: &Read, kext: i64, dims: &[i64]) -> Contrac
     let (_shb, stb) = axes_of(&b.layout);
     let rank = sha.len();
     let kax = rank - 1;
-    assert_eq!(sha[kax], kext, "k axis extent");
+    assert_eq!(sha[kax], kext, "k axis extent: a.sha={sha:?} a.sta={sta:?} b.sta={stb:?} kext={kext} dims={dims:?}");
     let mut a_only: Vec<usize> = Vec::new();
     let mut b_only: Vec<usize> = Vec::new();
     let mut b_axes: Vec<usize> = Vec::new();
@@ -204,9 +309,27 @@ fn resolve_read(g: &GraphIr, hazard: &std::collections::HashSet<usize>, r: &Read
         if bsh != csh {
             break;
         }
-        cur = Read { src: a.src, layout: comp, base: 0 };
+        cur = Read { src: a.src, layout: comp, base: 0, nls: cur.nls.clone() };
     }
     cur
+}
+
+fn pack_nls(nls: &[Nl]) -> u32 {
+    assert!(nls.len() <= 8, "nl-chain longer than 8 not packable");
+    let mut ops = 0u32;
+    for (k, nl) in nls.iter().enumerate() {
+        let op: u32 = match nl {
+            Nl::Exp2 => 1,
+            Nl::Recip => 2,
+            Nl::Sqrt => 3,
+            Nl::Rsqrt => 4,
+            Nl::Relu => 5,
+            Nl::Step => 6,
+            Nl::CastF32 => 7,
+        };
+        ops |= op << (4 * k as u32);
+    }
+    ops
 }
 
 fn eval_flat(sh: &[i64], st: &[i64], i: i64) -> i64 {
@@ -256,8 +379,8 @@ pub struct NativeExec {
     input_ids: std::collections::HashSet<usize>,
     hazard: std::collections::HashSet<usize>,
     pending: std::collections::HashMap<usize, (Read, i64)>,
-    force_no_attn: bool,
-    race_ambiguous: bool,
+    fused_names: std::collections::HashMap<u64, &'static str>,
+    pub dead: std::collections::HashSet<usize>,
 }
 
 impl NativeExec {
@@ -273,8 +396,8 @@ impl NativeExec {
             input_ids: Default::default(),
             hazard: Default::default(),
             pending: Default::default(),
-            force_no_attn: false,
-            race_ambiguous: false,
+            fused_names: Default::default(),
+            dead: Default::default(),
         }
     }
 
@@ -300,6 +423,7 @@ impl NativeExec {
     }
 
     fn emit_plain_copy(&mut self, id: usize, a: &Read, n: i64) {
+        assert!(a.nls.is_empty(), "copy_strided cannot apply inline nls");
         let meta = meta_of(&a.layout).expect("copy meta");
         let out = self.alloc(n as usize * 4);
         let sb = self.use_buf(a.src);
@@ -404,44 +528,10 @@ impl NativeExec {
     }
 
     pub fn build(&mut self, g: &GraphIr, inputs: &std::collections::HashMap<String, Vec<f32>>) {
-        self.race_ambiguous = false;
-        self.force_no_attn = false;
+        let coarsen = std::env::var("NOCOARSEN").is_err();
+        let fused = (!coarsen && std::env::var("NOFUSE").is_err()).then(|| crate::compose::refine_pointwise(g));
+        let g = fused.as_ref().unwrap_or(g);
         self.build_inner(g, inputs);
-        if self.race_ambiguous && !self.inplace_cache && std::env::var("GENERAL_ONLY").is_err() {
-            let t_fused = self.time_replay();
-            let tape = std::mem::take(&mut self.tape);
-            let bufs = std::mem::take(&mut self.bufs);
-            let pending = std::mem::take(&mut self.pending);
-            let input_ids = std::mem::take(&mut self.input_ids);
-            let (disp, alloc, elided) = (self.dispatches, self.alloc_total, self.elided);
-            self.force_no_attn = true;
-            self.build_inner(g, inputs);
-            self.force_no_attn = false;
-            let t_dec = self.time_replay();
-            if std::env::var("ATTNTUNE").is_ok() {
-                eprintln!("attn whole-graph race: fused {t_fused:.3} ms vs decomposed {t_dec:.3} ms");
-            }
-            if t_fused <= t_dec {
-                self.tape = tape;
-                self.bufs = bufs;
-                self.pending = pending;
-                self.input_ids = input_ids;
-                self.dispatches = disp;
-                self.alloc_total = alloc;
-                self.elided = elided;
-            }
-        }
-    }
-
-    fn time_replay(&self) -> f64 {
-        self.replay();
-        let mut best = f64::INFINITY;
-        for _ in 0..2 {
-            let t = std::time::Instant::now();
-            self.replay();
-            best = best.min(t.elapsed().as_secs_f64() * 1e3);
-        }
-        best
     }
 
     fn build_inner(&mut self, g: &GraphIr, inputs: &std::collections::HashMap<String, Vec<f32>>) {
@@ -452,16 +542,6 @@ impl NativeExec {
         self.dispatches = 0;
         self.alloc_total = 0;
         self.elided = 0;
-        let mut fusions = if std::env::var("GENERAL_ONLY").is_ok() {
-            native_fuse::Fusions {
-                claims: Default::default(),
-                rms: Default::default(),
-                silu: Default::default(),
-                attn: Default::default(),
-            }
-        } else {
-            native_fuse::plan(g)
-        };
         self.hazard = Default::default();
         if self.inplace_cache {
             for node in g.nodes.iter() {
@@ -491,94 +571,56 @@ impl NativeExec {
                 _ => {}
             }
         }
-        let litf = |id: usize| -> f32 {
-            match &g.nodes[id].kind {
-                NodeKind::LiteralF32(v) => v[0],
-                _ => panic!("expected scalar literal"),
-            }
-        };
-        if !fusions.attn.is_empty() {
-            let mut users: Vec<Vec<usize>> = vec![Vec::new(); g.nodes.len()];
-            for (i, node) in g.nodes.iter().enumerate() {
-                match &node.kind {
-                    NodeKind::Move { a, b, .. } => {
-                        users[a.src].push(i);
-                        if let Some(b) = b {
-                            users[b.src].push(i);
-                        }
+        let coarsen = std::env::var("NOCOARSEN").is_err();
+        let mut partition: std::collections::HashMap<usize, (crate::extract::Servicer, Vec<usize>)> =
+            Default::default();
+        let mut kskip: std::collections::HashSet<usize> = Default::default();
+        if coarsen {
+            let outputs: Vec<usize> = (0..g.nodes.len()).collect();
+            for k in crate::extract::partition(g, &outputs) {
+                for &n in &k.nodes {
+                    if n != k.out {
+                        kskip.insert(n);
                     }
-                    NodeKind::Pointwise { read, .. } => users[read.src].push(i),
-                    _ => {}
                 }
-            }
-            let heads: Vec<(usize, (usize, usize, usize, usize, usize, usize))> =
-                fusions.attn.iter().map(|(k, v)| (*k, *v)).collect();
-            for (id, (_q, _kc, _v, mask, cs, sc)) in heads {
-                if self.force_no_attn {
-                    unclaim_attn_head(g, &users, &mut fusions, id, sc);
-                    continue;
-                }
-                let (p, vec_ok, _, _, _) = self.attn_setup(g, id, mask, litf(cs), sc);
-                let (_, _, _, fused_ms) = self.backend.tune_attn(&p, vec_ok);
-                let NodeKind::Move { a: sa, b: Some(sb), kext: sk, .. } = &g.nodes[sc].kind else {
-                    continue;
-                };
-                let NodeKind::Move { a: pa, b: Some(pb), kext: pk, .. } = &g.nodes[id].kind else {
-                    continue;
-                };
-                let sar = resolve_read(g, &self.hazard, sa);
-                let sbr = resolve_read(g, &self.hazard, sb);
-                let par = resolve_read(g, &self.hazard, pa);
-                let pbr = resolve_read(g, &self.hazard, pb);
-                let cls = classify_contract(&sar, &sbr, *sk, &g.nodes[sc].dims);
-                let clp = classify_contract(&par, &pbr, *pk, &g.nodes[id].dims);
-                let s_ms = self.backend.tune_gemm(cls.m, *sk as usize, cls.n, cls.ap, cls.bp, cls.cp, &cls.batch, cls.nbatch);
-                let p_ms = self.backend.tune_gemm(clp.m, *pk as usize, clp.n, clp.ap, clp.bp, clp.cp, &clp.batch, clp.nbatch);
-                if s_ms + p_ms < fused_ms {
-                    self.race_ambiguous = true;
-                }
+                partition.insert(k.out, (k.servicer, k.nodes));
             }
         }
         for (id, node) in g.nodes.iter().enumerate() {
-            if fusions.claims.contains(&id) {
+            if self.dead.contains(&id) {
+                self.elided += 1;
                 continue;
             }
-            if let Some((x, ce)) = fusions.rms.get(&id) {
-                let xd = g.nodes[*x].dims.clone();
-                let cols = *xd.last().unwrap();
-                let rows = numel(&xd) / cols;
-                let out = self.alloc(numel(&xd) as usize * 4);
-                let xb = self.use_buf(*x);
-                self.guard_write_overlap(id, &out, &[&xb]);
-                self.push1d(
-                    "rmsnorm_row",
-                    vec![xb, out.clone()],
-                    vec![],
-                    vec![(2, rows as u32), (3, cols as u32), (4, litf(*ce).to_bits())],
-                    vec![],
-                    rows as u64 * 256,
-                );
-                self.bufs[id] = Some(out);
-                continue;
+            if coarsen {
+                if let Some((servicer, nodes)) = partition.get(&id) {
+                    match servicer {
+                        crate::extract::Servicer::Flash { scores, mask, .. } => {
+                            let hd = match &g.nodes[*scores].kind {
+                                NodeKind::Move { kext, .. } => *kext,
+                                _ => 1,
+                            };
+                            let scale = 1.0f32 / (hd as f32).sqrt();
+                            let (sc, mask) = (*scores, *mask);
+                            self.emit_attn(g, id, 0, 0, 0, mask, scale, sc);
+                            continue;
+                        }
+                        crate::extract::Servicer::Reduce(rr) => {
+                            self.emit_reduce_region(g, &rr.clone());
+                            continue;
+                        }
+                        crate::extract::Servicer::Elementwise => {
+                            self.emit_fused_region(g, &nodes.clone(), id);
+                            continue;
+                        }
+                        crate::extract::Servicer::Contraction | crate::extract::Servicer::Primitive => {}
+                    }
+                } else if kskip.contains(&id) {
+                    self.elided += 1;
+                    continue;
+                }
             }
-            if let Some((gg, up, cl, c1)) = fusions.silu.get(&id) {
-                let n = numel(&g.nodes[id].dims);
-                let out = self.alloc(n as usize * 4);
-                let (gb, ub) = (self.use_buf(*gg), self.use_buf(*up));
-                self.guard_write_overlap(id, &out, &[&gb, &ub]);
-                self.push1d(
-                    "silu_mul",
-                    vec![gb, ub, out.clone()],
-                    vec![],
-                    vec![(3, n as u32), (4, litf(*cl).to_bits()), (5, litf(*c1).to_bits())],
-                    vec![],
-                    n as u64,
-                );
-                self.bufs[id] = Some(out);
-                continue;
-            }
-            if let Some((q, kc, v, mask, cs, sc)) = fusions.attn.get(&id) {
-                self.emit_attn(g, id, *q, *kc, *v, *mask, litf(*cs), *sc);
+            if matches!(node.kind, NodeKind::Pointwise { .. }) && !referenced[id] {
+                self.elided += 1;
                 continue;
             }
             let dims = node.dims.clone();
@@ -613,13 +655,15 @@ impl NativeExec {
                         other => panic!("pointwise {other:?} unused by this model"),
                     };
                     let rr = resolve_read(g, &self.hazard, read);
+                    assert!(rr.nls.is_empty(), "pointwise _s kernels cannot apply inline nls");
                     let meta = meta_of(&rr.layout).expect("pointwise meta");
                     let out = self.alloc(n as usize * 4);
                     let sb = self.use_buf(rr.src);
                     self.guard_write_overlap(id, &out, &[&sb]);
-                    self.push1d(
+                    self.push1d_off(
                         kernel,
                         vec![sb, out.clone()],
+                        vec![(rr.base * 4) as u64, 0],
                         vec![(3, meta)],
                         vec![(2, n as u32)],
                         vec![],
@@ -627,12 +671,13 @@ impl NativeExec {
                     );
                     self.bufs[id] = Some(out);
                 }
-                NodeKind::Move { a, b, kext, pair, a_idx, write_idx, write_base } => {
+                NodeKind::Move { a, b, kext, pair, a_idx, write_idx, write_base, reduce_max } => {
                     let ar = resolve_read(g, &self.hazard, a);
                     let br = b.as_ref().map(|r| resolve_read(g, &self.hazard, r));
                     if write_idx.is_empty()
                         && b.is_none()
                         && *kext == 1
+                        && ar.nls.is_empty()
                         && !self.hazard.contains(&ar.src)
                         && identity_move(g, node, &ar, a_idx, n)
                     {
@@ -656,7 +701,7 @@ impl NativeExec {
                     } else if !*pair && br.is_some() {
                         self.emit_binary(g, id, "add_strided", &ar, br.as_ref().unwrap(), &dims);
                     } else {
-                        self.emit_reduce(g, id, &ar, *kext, n);
+                        self.emit_reduce(g, id, &ar, *kext, n, *reduce_max);
                     }
                 }
             }
@@ -695,6 +740,7 @@ impl NativeExec {
         let qa = resolve_read(g, &self.hazard, qa);
         let kb = resolve_read(g, &self.hazard, kb);
         let vb = resolve_read(g, &self.hazard, vb);
+        assert!(qa.nls.is_empty() && kb.nls.is_empty() && vb.nls.is_empty(), "attn kernels cannot apply inline nls");
         let (_, qst) = axes_of(&qa.layout);
         let (_, kst) = axes_of(&kb.layout);
         let (_, vst) = axes_of(&vb.layout);
@@ -739,9 +785,7 @@ impl NativeExec {
         scale: f32,
         sc: usize,
     ) {
-        let (mut p, vec_ok, qsrc, ksrc, vsrc) = self.attn_setup(g, id, mask, scale, sc);
-        let (kind, x, y, _ms) = self.backend.tune_attn(&p, vec_ok);
-        p[24] = (x | (y << 8) | (kind << 16)) as i32;
+        let (p, vec_ok, qsrc, ksrc, vsrc) = self.attn_setup(g, id, mask, scale, sc);
         let n_out = numel(&g.nodes[id].dims);
         let out = self.alloc(n_out as usize * 4);
         let (qbuf, kbuf, vbuf, mbuf) = (
@@ -751,19 +795,111 @@ impl NativeExec {
             self.use_buf(mask),
         );
         self.guard_write_overlap(id, &out, &[&qbuf, &kbuf, &vbuf, &mbuf]);
-        let (threads, _tg) = crate::metal_backend::CuteMetal::attn_grid(&p, kind, x);
-        self.tape.push(Tape::Run1d {
-            kernel: "attn_online",
+        let comp = crate::kernelset::Composition::Flash(crate::kernelset::AttnShape { p, vec_ok });
+        let (kidx, variant) = if std::env::var("FORCE_MLX_ATTN").is_ok() || std::env::var("FORCE_MLX_ALL").is_ok() {
+            (self.backend.kernel_index("mlx_sdpa"), crate::kernelset::Variant([0; 5]))
+        } else {
+            self.backend.search_cached(&comp)
+        };
+        self.tape.push(Tape::Kernel {
+            kidx,
+            variant,
             bufs: vec![qbuf, kbuf, vbuf, mbuf, out.clone()],
-            offsets: Vec::new(),
-            metas: vec![],
-            scalars: vec![],
-            specs: vec![],
-            progs: vec![(5, p)],
-            n: threads,
+            comp,
         });
         self.dispatches += 1;
         self.bufs[id] = Some(out);
+    }
+
+    fn emit_reduce_region(&mut self, g: &GraphIr, rr: &crate::coarsen::ReduceRegion) {
+        use std::collections::{HashMap, HashSet};
+        use std::hash::{Hash, Hasher};
+        let internal = rr.internal();
+        let s0 = &rr.stages[0];
+        let NodeKind::Move { kext, .. } = &g.nodes[s0.reduce].kind else { return };
+        let cols = *kext;
+        let rows = numel(&g.nodes[s0.reduce].dims);
+        let root = rr.root();
+        let n_full = numel(&g.nodes[root].dims);
+
+        let mut ext: Vec<(usize, [i32; 18])> = Vec::new();
+        let mut slot: HashMap<String, usize> = HashMap::new();
+        let mut special: HashMap<usize, String> = HashMap::new();
+        let mut stage_src: Vec<(String, bool, String)> = Vec::new();
+
+        for (k, st) in rr.stages.iter().enumerate() {
+            let NodeKind::Move { a: r_a, .. } = &g.nodes[st.reduce].kind else { return };
+            let r_a = r_a.clone();
+            let pre = gen_operand(g, &r_a, &internal, &special, "e", &mut ext, &mut slot);
+            let post_tail = st.post.last().copied().unwrap_or(st.reduce);
+            let vexpr = if st.post.is_empty() {
+                format!("t{k}")
+            } else {
+                let post_set: HashSet<usize> = st.post.iter().copied().collect();
+                let mut sp2 = special.clone();
+                sp2.insert(st.reduce, format!("t{k}"));
+                gen_node(g, post_tail, &post_set, &sp2, "row", &mut ext, &mut slot)
+            };
+            stage_src.push((pre, st.reduce_max, vexpr));
+            special.insert(st.reduce, format!("t{k}"));
+            special.insert(post_tail, format!("v{k}"));
+        }
+        let out_expr = gen_node(g, root, &internal, &special, "e", &mut ext, &mut slot);
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for (p, m, v) in &stage_src {
+            p.hash(&mut hasher);
+            m.hash(&mut hasher);
+            v.hash(&mut hasher);
+        }
+        out_expr.hash(&mut hasher);
+        ext.len().hash(&mut hasher);
+        let h = hasher.finish();
+        let name: &'static str = *self
+            .fused_names
+            .entry(h)
+            .or_insert_with(|| Box::leak(format!("rfused_{h:x}").into_boxed_str()));
+        self.backend.ensure_reduce_fused(name, ext.len(), &stage_src, &out_expr);
+
+        let out = self.alloc(n_full as usize * 4);
+        let mut bufs = vec![out.clone()];
+        for (s, _) in &ext {
+            bufs.push(self.use_buf(*s));
+        }
+        let b = 1 + ext.len();
+        let scalars = vec![(b as u64, rows as u32), ((b + 1) as u64, cols as u32)];
+        let metas: Vec<(u64, [i32; 18])> =
+            ext.iter().enumerate().map(|(k, (_, m))| ((b + 2 + k) as u64, *m)).collect();
+        self.push1d(name, bufs, metas, scalars, vec![], (rows * 256) as u64);
+        self.bufs[root] = Some(out);
+    }
+
+    fn emit_fused_region(&mut self, g: &GraphIr, region: &[usize], root: usize) {
+        use std::hash::{Hash, Hasher};
+        let dims = g.nodes[root].dims.clone();
+        let n = numel(&dims);
+        let (hdr, body, ext) = gen_region_body(g, region);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hdr.hash(&mut hasher);
+        body.hash(&mut hasher);
+        root.hash(&mut hasher);
+        let h = hasher.finish();
+        let name: &'static str = *self
+            .fused_names
+            .entry(h)
+            .or_insert_with(|| Box::leak(format!("fused_{h:x}").into_boxed_str()));
+        self.backend.ensure_fused(name, &hdr, &body, root);
+        let out = self.alloc(n as usize * 4);
+        let mut bufs = vec![out.clone()];
+        for (s, _) in &ext {
+            bufs.push(self.use_buf(*s));
+        }
+        let b = 1 + ext.len();
+        let scalars = vec![(b as u64, n as u32)];
+        let metas: Vec<(u64, [i32; 18])> =
+            ext.iter().enumerate().map(|(k, (_, m))| ((b + 1 + k) as u64, *m)).collect();
+        self.push1d(name, bufs, metas, scalars, vec![], n as u64);
+        self.bufs[root] = Some(out);
     }
 
     fn emit_binary(&mut self, _g: &GraphIr, id: usize, kernel: &'static str, a: &Read, b: &Read, dims: &[i64]) {
@@ -775,27 +911,30 @@ impl NativeExec {
         let out = self.alloc(n as usize * 4);
         let (ab, bb) = (self.use_buf(a.src), self.use_buf(b.src));
         self.guard_write_overlap(id, &out, &[&ab, &bb]);
-        self.push1d(
+        self.push1d_off(
             kernel,
             vec![ab, bb, out.clone()],
+            vec![(a.base * 4) as u64, (b.base * 4) as u64, 0],
             vec![(4, ma), (5, mb)],
-            vec![(3, n as u32)],
+            vec![(3, n as u32), (6, pack_nls(&a.nls)), (7, pack_nls(&b.nls))],
             vec![],
             n as u64,
         );
         self.bufs[id] = Some(out);
     }
 
-    fn emit_reduce(&mut self, _g: &GraphIr, id: usize, a: &Read, kext: i64, n: i64) {
+    fn emit_reduce(&mut self, _g: &GraphIr, id: usize, a: &Read, kext: i64, n: i64, reduce_max: bool) {
         let meta = meta_of(&a.layout).expect("reduce meta");
         let out = self.alloc(n as usize * 4);
         let sb = self.use_buf(a.src);
         self.guard_write_overlap(id, &out, &[&sb]);
-        self.push1d(
-            "reduce_sum_l",
+        let kernel = if reduce_max { "reduce_max_l" } else { "reduce_sum_l" };
+        self.push1d_off(
+            kernel,
             vec![sb, out.clone()],
+            vec![(a.base * 4) as u64, 0],
             vec![(5, meta)],
-            vec![(2, n as u32), (3, kext as u32), (4, 1u32)],
+            vec![(2, n as u32), (3, kext as u32), (4, 1u32), (6, pack_nls(&a.nls))],
             vec![],
             n as u64,
         );
@@ -803,6 +942,7 @@ impl NativeExec {
     }
 
     fn emit_gather(&mut self, _g: &GraphIr, id: usize, a: &Read, idx: &[IdxRead], n: i64) {
+        assert!(a.nls.is_empty(), "gather cannot apply inline nls");
         let rmeta = meta_of(&a.layout).expect("gather rmeta");
         let mut rspec = [0i32; 8];
         rspec[0] = idx.len() as i32;
@@ -832,6 +972,7 @@ impl NativeExec {
         base: usize,
         dims: &[i64],
     ) {
+        assert!(a.nls.is_empty(), "scatter cannot apply inline nls");
         let n = numel(dims);
         let alias = self.inplace_cache && matches!(g.nodes[base].kind, NodeKind::Input { .. });
         let out = if alias {
@@ -870,33 +1011,34 @@ impl NativeExec {
     }
 
     fn emit_contract(&mut self, _g: &GraphIr, id: usize, a: &Read, b: &Read, kext: i64, dims: &[i64]) {
+        assert!(a.base == 0 && b.base == 0, "contraction operand base offsets not yet threaded through the Mm path");
+        assert!(a.nls.is_empty() && b.nls.is_empty(), "contraction kernels cannot apply inline nls");
         let cl = classify_contract(a, b, kext, dims);
         let (m, nn, ap, bp, cp, batch, nbatch) =
-            (cl.m, cl.n, cl.ap, cl.bp, cl.cp, cl.batch, cl.nbatch);
+            (cl.m, cl.n, cl.ap, cl.bp, cl.cp, cl.batch.clone(), cl.nbatch);
         let n_out = numel(dims);
         let out = self.alloc(n_out as usize * 4);
         let (ab, bb) = (self.use_buf(a.src), self.use_buf(b.src));
         self.guard_write_overlap(id, &out, &[&ab, &bb]);
-        if nbatch == 1 && m == 1 && (bp[2] == 1 || bp[1] == 1) {
-            self.backend
-                .tune_gemv(kext as usize, nn as usize, &ab, &bb, ap, bp);
-        }
-        if m > 1 && std::env::var("GENERAL_ONLY").is_err() {
-            self.backend
-                .tune_gemm(m, kext as usize, nn, ap, bp, cp, &batch, nbatch);
-        }
-        self.tape.push(Tape::Mm {
-            a: ab,
-            b: bb,
-            c: out.clone(),
-            m: m as usize,
-            k: kext as usize,
-            n: nn as usize,
-            ap,
-            bp,
-            cp,
-            batch,
-            nbatch,
+        let _ = &batch;
+        let comp = crate::kernelset::Composition::Contraction { shape: cl.clone(), kext };
+        let mlx_ok = nbatch == 1
+            && ap[1] == kext as i32 && ap[2] == 1
+            && bp[1] == nn as i32 && bp[2] == 1
+            && cp[1] == nn as i32 && cp[2] == 1;
+        let (kidx, variant) = if std::env::var("GENERAL_ONLY").is_ok() {
+            let name = if nbatch > 1 { "bmm_scalar" } else { "scalar_matmul" };
+            (self.backend.kernel_index(name), crate::kernelset::Variant([254, 0, 0, 0, 0]))
+        } else if mlx_ok && (std::env::var("FORCE_MLX_MATMUL").is_ok() || std::env::var("FORCE_MLX_ALL").is_ok()) {
+            (self.backend.kernel_index("mlx_matmul"), crate::kernelset::Variant([255, 0, 0, 0, 0]))
+        } else {
+            self.backend.search_cached(&comp)
+        };
+        self.tape.push(Tape::Kernel {
+            kidx,
+            variant,
+            bufs: vec![ab, bb, out.clone()],
+            comp,
         });
         self.dispatches += 1;
         self.bufs[id] = Some(out);
@@ -905,41 +1047,25 @@ impl NativeExec {
     pub fn dump_tape(&self) {
         use std::collections::BTreeMap;
         let mut c: BTreeMap<&str, usize> = BTreeMap::new();
-        let mut mm = 0;
         for t in &self.tape {
             match t {
                 Tape::Run1d { kernel, .. } => *c.entry(kernel).or_default() += 1,
-                Tape::Mm { .. } => mm += 1,
+                Tape::Kernel { kidx, .. } => *c.entry(self.backend.kernel_name(*kidx)).or_default() += 1,
             }
         }
-        eprintln!("tape: {} entries, Mm={mm}", self.tape.len());
+        eprintln!("tape: {} entries", self.tape.len());
         for (k, v) in &c {
             eprintln!("  {k} x{v}");
         }
     }
 
     pub fn replay(&self) {
-        let cb = self.backend.owned_command_buffer();
+        let mut cb = self.backend.owned_command_buffer();
         for t in &self.tape {
             match t {
                 Tape::Run1d { kernel, bufs, offsets, metas, scalars, specs, progs, n } => {
                     let enc = self.backend.enc(&cb, kernel);
-                    let mut tg_override = None;
-                    if *kernel == "attn_online" {
-                        let pr = progs[0].1;
-                        let kind = ((pr[24] >> 16) & 0xff) as u32;
-                        let x = (pr[24] & 0xff).max(1) as u32;
-                        let y = ((pr[24] >> 8) & 0xff).max(1) as u32;
-                        let pipe = if kind == 1 {
-                            tg_override = Some(32 * x as u64);
-                            self.backend.flash_pipeline(x, y)
-                        } else {
-                            self.backend.attn_pipeline(x, y)
-                        };
-                        enc.set_compute_pipeline_state(&pipe);
-                    } else {
-                        enc.set_compute_pipeline_state(self.backend.pipeline(kernel));
-                    }
+                    enc.set_compute_pipeline_state(self.backend.pipeline(kernel));
                     for (k, b) in bufs.iter().enumerate() {
                         enc.set_buffer(k as u64, Some(b), offsets.get(k).copied().unwrap_or(0));
                     }
@@ -955,20 +1081,21 @@ impl NativeExec {
                     for (slot, pr) in progs {
                         enc.set_bytes(*slot, 100, pr.as_ptr() as *const _);
                     }
-                    let tg = tg_override.unwrap_or(256u64.min((*n).max(1)));
+                    let tg = 256u64.min((*n).max(1));
                     enc.dispatch_threads(
                         metal::MTLSize::new((*n).max(1), 1, 1),
                         metal::MTLSize::new(tg, 1, 1),
                     );
                     enc.end_encoding();
                 }
-                Tape::Mm { a, b, c, m, k, n, ap, bp, cp, batch, nbatch } => {
-                    if *nbatch > 1 {
-                        self.backend
-                            .bmm_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp, batch, *nbatch as u64);
-                    } else {
-                        self.backend
-                            .matmul_or_gemv_into(&cb, a, b, c, *m, *k, *n, *ap, *bp, *cp);
+                Tape::Kernel { kidx, variant, bufs, comp } => {
+                    if self.backend.kernel_breaks_cb(*kidx) {
+                        cb.commit();
+                        cb.wait_until_completed();
+                    }
+                    self.backend.run_kernel(&cb, *kidx, *variant, bufs, comp);
+                    if self.backend.kernel_breaks_cb(*kidx) {
+                        cb = self.backend.owned_command_buffer();
                     }
                 }
             }
@@ -980,5 +1107,41 @@ impl NativeExec {
     pub fn read_f32(&self, g: &GraphIr, id: usize) -> Vec<f32> {
         let n = numel(&g.nodes[id].dims) as usize;
         self.backend.read(&self.buf(id), n)
+    }
+
+    pub fn first_divergence(&self, g: &GraphIr, refm: &crate::cpu_ref::CpuRef) -> Option<(usize, f32)> {
+        for id in 0..g.nodes.len() {
+            let Some(buf) = self.bufs[id].as_ref() else { continue };
+            if g.nodes[id].dtype != Dt::F32 {
+                continue;
+            }
+            let Some(rv) = refm.f[id].as_ref() else { continue };
+            let n = numel(&g.nodes[id].dims) as usize;
+            let nv = self.backend.read(buf, n);
+            if nv.len() != rv.len() {
+                return Some((id, f32::INFINITY));
+            }
+            let peak = rv.iter().fold(1e-9f32, |m, &x| m.max(x.abs()));
+            let maxd = nv.iter().zip(rv).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+            if maxd > 1e-3 * peak {
+                return Some((id, maxd / peak));
+            }
+        }
+        None
+    }
+
+    pub fn first_nan(&self, g: &GraphIr) -> Option<(usize, usize)> {
+        for id in 0..g.nodes.len() {
+            let Some(buf) = self.bufs[id].as_ref() else { continue };
+            if g.nodes[id].dtype != Dt::F32 {
+                continue;
+            }
+            let n = numel(&g.nodes[id].dims) as usize;
+            let v = self.backend.read(buf, n);
+            if let Some(k) = v.iter().position(|x| x.is_nan()) {
+                return Some((id, k));
+            }
+        }
+        None
     }
 }
